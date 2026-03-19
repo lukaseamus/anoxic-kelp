@@ -1,0 +1,1154 @@
+# 1. Load data ####
+# Load output from Metrohm Titrando PC control V1
+require(tidyverse)
+require(here)
+require(magrittr)
+files <- here("Alkalinity", "Raw") %>% 
+  list.files(pattern = "\\.txt$", full.names = TRUE)
+
+TA <- files %>%
+  map(~ read.delim(.x, skip = 23, header = FALSE) %>% # read text file, skipping some rows
+        mutate(Name = first(V1),
+               pH_initial = V2[V1 == "Initial pH"] %>% as.numeric(), # extract relevant numbers
+               HCl_M = V2[V1 == "CONC"] %>% as.numeric(), # in the lower section of the text file
+               Date_time = V4[V1 == "Total_Alkalinity"][1] %>%
+                 ymd_hms(tz = "Asia/Singapore"),
+               pH_slope = V2[V1 == "pH electrode"] %>% as.numeric(),
+               pH_cal = V6[V1 == "pH electrode"] %>% 
+                 ymd_hms(tz = "Asia/Singapore")) %>%
+        separate_wider_delim(Name, delim = "_", names = c("Date", "Sample"), 
+                             too_many = "merge", too_few = "align_end") %>%
+        slice(first(which(V2 != "")):n()) %>% # remove the upper section of the text file
+        slice(1:first(which(V2 == "")) - 1) %>% # remove the lower section of the text file
+        mutate(across(c(V1, V2, V3, V4, V5, V6), as.numeric),
+               Date = Date %>% ymd()) %>%
+        rename(n = V1, t = V2, pH = V3, mL = V4, µL_min = V5, Temp = V6)) %>%
+  set_names(map_chr(., ~ first(.x$Sample))) %T>%
+  print()
+
+# Examples
+TA$Anoxic_Kelp_4.6 # first experiment
+TA$Anoxic_V2_7.1 # second experiment
+TA$Anoxia_3.1.16 # third experiment
+
+# Check redundancy of Date and Date_time
+TA %>%
+  map(~ .x %>% 
+        mutate(Date_check = identical(Date, Date_time %>% as_date()))
+      ) %>%
+  bind_rows() %>%
+  group_by(Sample, Date, Date_time) %>%
+  summarise(Date_check = unique(Date_check)) %>%
+  print(n = 300)
+# All good (date was not part of sample name for CRM)
+
+# Remove Date, Date_file and ID
+TA %<>%
+  map(~ .x %>% select(-Date))
+
+# Compare time to last calibration
+TA %>%
+  map(~ .x %>% 
+        mutate(Time = pH_cal %--% Date_time / ddays())
+      ) %>%
+  bind_rows() %>%
+  group_by(Date_time, Sample) %>%
+  summarise(Time = mean(Time)) %>%
+  arrange(Time) %>%
+  print(n = 300)
+# Never more than 7 days between calibration and measurement; 
+# mostly done on the same day.
+
+# Calculate pH slope summary statistics
+TA %>%
+  bind_rows() %>%
+  summarise(pH_slope_min = min(pH_slope),
+            pH_slope_max = max(pH_slope),
+            pH_slope_mean = mean(pH_slope),
+            pH_slope_sd = sd(pH_slope))
+
+
+# 2. Raw models ####
+# 2.1 Visualise data ####
+require(patchwork)
+TA %>%
+  imap(~ .x %>%
+        ggplot() +
+          geom_hline(yintercept = 3) + # endpoint pH
+          geom_point(aes(t, pH), shape = 16, alpha = 0.2) +
+          theme_minimal() +
+          theme(panel.grid = element_blank()) +
+          ggtitle(.y)
+       ) %>%
+  wrap_plots() %>%
+  ggsave(filename = "TA_data.pdf", path = here("Alkalinity", "Plots"), 
+         width = 100, height = 50, unit = "cm", device = cairo_pdf)
+# Most curves look fine but Anoxic_V2_4.50_1 and Anoxia_3.6.30 were overacidified. 
+# Only Anoxic_V2_4.50_1 was repeated as Anoxic_V2_4.50. TA cannot directly be estimated for 
+# overacidified samples. However, given an average pH vs. acid volume slope, 
+# one could get estimates..
+# Save these data to a separate list:
+TA_fails <- TA %>%
+  map(~ .x %>% 
+        filter(Sample == "Anoxia_3.6.30")
+      ) %>%
+  keep(~ nrow(.x) > 0)
+
+# Clean data
+TA %<>%
+  map(~ .x %>% 
+        filter(!Sample %in% c("Anoxia_3.6.30", "Anoxic_V2_4.50_1", "Anoxia_V2_8.92_2"))
+  ) %>%
+  keep(~ nrow(.x) > 0)
+# I also removed Anoxia_V2_8.92_2 which was a continued acidification
+
+# Visualise clean data
+TA %>%
+  imap(~ .x %>%
+        ggplot() +
+          geom_hline(yintercept = 3) + # endpoint pH
+          geom_point(aes(t, pH), shape = 16, alpha = 0.2) +
+          theme_minimal() +
+          theme(panel.grid = element_blank()) +
+          ggtitle(.y)
+       ) %>%
+  wrap_plots() %>%
+  ggsave(filename = "TA_data_cleaned.pdf", path = here("Alkalinity", "Plots"), 
+         width = 100, height = 50, unit = "cm", device = cairo_pdf)
+# Looks fine
+
+# 2.2 Transform data ####
+# pH responds non-linearly with increasing acid volume:
+TA %>%
+  imap(~ .x %>%
+        ggplot() +
+          geom_hline(yintercept = 3) + # endpoint pH
+          geom_point(aes(mL, pH), shape = 16, alpha = 0.2) +
+          theme_minimal() +
+          theme(panel.grid = element_blank()) +
+          ggtitle(.y)
+       ) %>%
+  wrap_plots() %>%
+  ggsave(filename = "TA_data_mL.pdf", path = here("Alkalinity", "Plots"), 
+         width = 100, height = 50, unit = "cm", device = cairo_pdf)
+# pH therefore needs to be transformed to [H+] using the Gran function. 
+# Added acid volume correspondingly needs to be converted to µM or µeq
+# (HCl is monoprotic so N and M are equivalent). Expressing both variables
+# in units of µM in terms of sample volume makes their relationship  
+# interpretable.
+
+TA %<>%
+  map(~ .x %>%
+        # free [H+] in µM = total volume in µL * [H+] in M / sample volume in L
+        mutate(H_free = ( 10 + mL ) * 1e3 * 10^-pH / 0.01, # all samples had a volume of 10 mL
+               # added [H+] in µM = added acid in µmol / sample volume in L
+               H_added = mL * HCl_M * 1e3 / 0.01)
+  )
+
+TA %>%
+  imap(~ .x %>%
+        ggplot() +
+          geom_hline(yintercept = 0) + # zero free protons
+          geom_point(aes(H_added, H_free), shape = 16, alpha = 0.2) +
+          theme_minimal() +
+          theme(panel.grid = element_blank()) +
+          ggtitle(.y)
+       ) %>%
+  wrap_plots() %>%
+  ggsave(filename = "TA_data_transformed.pdf", path = here("Alkalinity", "Plots"), 
+         width = 100, height = 50, unit = "cm", device = cairo_pdf)
+
+# As is typical for the Gran plot, due to buffering effect of seawater, 
+# only free protons increase linearly with total protons added. To fit
+# a linear model, only the portion of data that are still nonlinear
+# need to be removed. Rather than doing this arbitrarily on a case-by-case
+# basis, we can set a cutoff pH. We know the equivalence point to lie
+# around pH 4 since all CO3 2- and HCO3- are fully converted to CO2.
+# But since there is often not a smooth transition from buffered to
+# free states around pH 4, which is precisely why we are using the Gran
+# function to estimate the equivalence point, I will set a lower cutoff 
+# of pH 3.5.
+
+TA %>%
+  imap(~ .x %>%
+        filter(pH <= 4) %>%
+        ggplot() +
+          geom_hline(yintercept = 0) + # zero free protons
+          geom_point(aes(H_added, H_free), shape = 16, alpha = 0.2) +
+          theme_minimal() +
+          theme(panel.grid = element_blank()) +
+          ggtitle(.y)
+       ) %>%
+  wrap_plots() %>%
+  ggsave(filename = "TA_data_linear.pdf", path = here("Alkalinity", "Plots"), 
+         width = 100, height = 50, unit = "cm", device = cairo_pdf)
+# Looks fairly linear in all cases
+
+# 2.3 Prepare data ####
+# Since I want to estimate an average slope of free protons over added protons 
+# in solution with which to salvage three of the four TA_fails, I need a multi-
+# level model. All data need to be combined into one tibble to achieve this. 
+# My key assumption is that the increase in free protons with protons added
+# beyond the buffering capacity is comparable across samples with different
+# buffering capacities.
+
+TA_data <- TA %>% 
+  map(~ .x %>% filter(pH <= 4) ) %>%
+  bind_rows() %>%
+  filter(Sample != "CRM") %>%
+  mutate(Sample = Sample %>% fct()) %T>%
+  print()
+
+# Standards need to be estimated in a separate multilevel model since I am
+# interested in deriving an average standard TA. Standards need unique IDs 
+# for this step.
+
+TA_standard_data <- TA %>% 
+  map(~ .x %>% filter(pH <= 4) ) %>%
+  bind_rows() %>%
+  filter(Sample == "CRM") %>%
+  mutate(Sample = Sample %>% 
+           str_c(Date_time, sep = "_") %>% 
+           fct()) %T>%
+  print()
+
+# 2.4 Sample model ####
+# 2.4.1 Prior simulation ####
+# The typical linear regression is parameterised as alpha + beta * x, but in
+# this case alpha is not meaningful. It is bound to be negative because the
+# x-intercept is always positive and negative free protons are not useful.
+# The x-intercept is our estimate of total alkalinity (TA) in µM because
+# it gives [H+] in µM at the equivalence point (transition from buffered
+# to non-buffered state) and is therefore best estimated directly. f(0), i.e.
+# all protons are buffered, thus yields 0 = alpha + beta * TA which allows
+# us to re-express alpha as -beta * TA. The reparameterised function therefore
+# is -beta * TA + beta * x = beta * ( x - TA ). Now the intercept term TA is
+# directly interpretable: for average seawater we expect 2300 µM. beta is
+# theoretically expected to lie around 1 since in the non-buffered state
+# all added protons are expected to be free, i.e. 1:1 relationship between
+# added and free protons.
+
+tibble(n = 1:1e3,
+       TA = rgamma(n = 1e3, shape = 2300^2 / 500^2, rate = 2300 / 500^2),
+       beta = rgamma(n = 1e3, shape = 1^2 / 0.5^2, rate = 1 / 0.5^2)) %>%
+  expand_grid(H_added = seq(0, 6000)) %>%
+  mutate(H_free = beta * ( H_added - TA )) %>%
+  ggplot(aes(H_added, H_free, group = n)) +
+    geom_hline(yintercept = 0) +
+    geom_line(alpha = 0.05) +
+    coord_cartesian(expand = F, clip = "off") +
+    theme_minimal() +
+    theme(panel.grid = element_blank())
+# Looks reasonable.
+
+# 2.4.2 Run model ####
+require(cmdstanr)
+TA_model <- here("Alkalinity", "Stan", "TA.stan") %>% 
+  read_file() %>%
+  write_stan_file() %>%
+  cmdstan_model()
+
+require(tidybayes)
+TA_samples <- TA_model$sample(
+  data = TA_data %>%
+    select(H_free, H_added, Sample) %>%
+    compose_data(),
+  chains = 8,
+  parallel_chains = parallel::detectCores(),
+  iter_warmup = 1e4,
+  iter_sampling = 1e4)
+
+# 2.4.3 Model checks ####
+TA_samples$summary() %>%
+  mutate(rhat_check = rhat > 1.001) %>%
+  summarise(rhat_1.001 = sum(rhat_check) / length(rhat), # proportion > 1.001
+            rhat_mean = mean(rhat),
+            rhat_sd = sd(rhat),
+            ess_mean = mean(ess_bulk),
+            ess_sd = sd(ess_bulk))
+# no rhat above 1.001
+# good effective sample size
+
+require(bayesplot)
+TA_samples$draws(format = "df") %>%
+  mcmc_rank_overlay() %>%
+  ggsave(filename = "TA_rank.pdf", path = "Plots",
+         width = 100, height = 50, unit = "cm", device = cairo_pdf)
+# chains look good
+
+TA_samples$draws(format = "df") %>%
+  mcmc_pairs(pars = c("beta[1]", "TA[1]"))
+TA_samples$draws(format = "df") %>%
+  mcmc_pairs(pars = c("beta[100]", "TA[100]"))
+# parameters are somewhat correlated but this is not an issue for the sampler
+
+# 2.4.4 Prior-posterior comparison ####
+source("functions.R")
+# sample priors
+TA_prior <- prior_samples(
+  model = TA_model,
+  data = TA_data %>%
+    select(H_free, H_added, ID) %>%
+    compose_data(),
+  chains = 8, samples = 1e4)
+
+# plot prior-posterior comparison
+TA_prior %>%
+  prior_posterior_draws(posterior_samples = TA_samples,
+                        group = TA_data %>% select(ID),
+                        parameters = c("beta[ID]", "TA[ID]",
+                                       "beta_mu", "beta_sigma", 
+                                       "sigma"),
+                        format = "long") %>%
+  prior_posterior_plot(group_name = "ID", ridges = FALSE) %>%
+  ggsave(filename = "TA_prior_posterior.pdf", path = "Plots",
+         width = 80, height = 80, unit = "cm", device = cairo_pdf)
+# posteriors are very well constrained
+
+# 2.4.5 Predictions ####
+# Split grouped tibble into list of tibbles for smoother computation
+TA_data_list <- TA_data %>%
+  group_by(ID) %>%
+  group_split() %>%
+  set_names(
+    map(., ~ .x %$% 
+          as.character(ID) %>% 
+          unique()
+    )
+  )
+
+TA_prior_posterior_list <- TA_prior %>%
+  prior_posterior_draws(posterior_samples = TA_samples,
+                        group = TA_data %>% select(ID),
+                        parameters = c("beta[ID]", "TA[ID]", "sigma"),
+                        format = "short") %>%
+  group_by(ID) %>%
+  group_split() %>%
+  set_names(
+    map(., ~ .x %$% 
+          as.character(ID) %>% 
+          unique()
+        )
+  )
+
+TA_predictions_list <- TA_prior_posterior_list %>%
+  map2(TA_data_list,
+       ~ .x %>% expand_grid(H_added = .y %$%
+                              seq(.x %>% # lower bound is minimum x-intercept
+                                    filter(distribution == "posterior") %$%
+                                    min(TA), 
+                                  max(H_added), # upper bound is maximum [H+]
+                                  length.out = 15))
+       ) %>%
+  map(~ .x %>%
+        mutate(mu = beta * ( H_added - TA ),
+               obs = rnorm( n(), mu, sigma ))
+      )
+
+TA_predictions_summary <- TA_predictions_list %>%
+  map(~ .x %>%
+        group_by(ID, distribution, H_added) %>%
+        reframe(mu = mu %>% mean_qi(.width = c(.5, .8, .9)),
+                obs = obs %>% mean_qi(.width = c(.5, .8, .9))) %>%
+        unnest(c(mu, obs), names_sep = "_")
+      ) %>%
+  bind_rows()
+
+# Remove raw predictions because they are too big
+rm(TA_data_list, TA_prior_posterior_list, TA_predictions_list) 
+
+ggsave(
+  TA_predictions_summary %>%
+    ggplot() +
+      geom_hline(yintercept = 0) +
+      geom_point(data = TA_data, 
+                 aes(H_added, H_free),
+                 shape = 16, alpha = 0.1) +
+      geom_line(data = . %>% filter(distribution == "posterior"),
+                aes(H_added, mu_y)) +
+      geom_ribbon(data = . %>% filter(distribution == "posterior"),
+                  aes(H_added, ymin = mu_ymin, ymax = mu_ymax,
+                      alpha = factor(mu_.width))) +
+      # geom_ribbon(data = . %>% filter(distribution == "posterior"), # unhash to check
+      #             aes(H_added, ymin = obs_ymin, ymax = obs_ymax, # predicted observations
+      #                 alpha = factor(obs_.width))) +
+      # geom_ribbon(data = . %>% filter(distribution == "prior", mu_.width == 0.9),
+      #             aes(H_added, ymin = mu_ymin, ymax = mu_ymax), # unhash to check prior
+      #                 colour = alpha("black", 0.3), fill = NA) +
+      scale_alpha_manual(values = c(0.5, 0.4, 0.3), guide = "none") +
+      facet_wrap(~ ID, scales = "free") +
+      theme_minimal() +
+      theme(panel.grid = element_blank()),
+  filename = "TA_prediction.pdf", path = "Plots",
+  width = 100, height = 50, unit = "cm", device = cairo_pdf)
+# Linear model fits well in all cases.
+
+# 2.4.6 Visualisations for supplement ####
+# Pull out a few examples for the supplement (A_16_D, J_4_D, M_12_D)
+TA_predictions_summary_selection <- TA_predictions_summary %>%
+  filter(ID %in% c("A_16_D", "J_4_D", "M_12_D")) %>%
+  mutate(Species = case_when(
+                      ID %>% str_detect("A") ~ "Amphiroa anceps",
+                      ID %>% str_detect("J") ~ "Jania rosea",
+                      ID %>% str_detect("M") ~ "Metamastophora flabellata"
+                      ) %>% fct_relevel("Amphiroa anceps")
+         )
+
+TA_data_selection <- TA_data %>% # these are the data the model was conditioned on
+  filter(ID %in% c("A_16_D", "J_4_D", "M_12_D")) %>%
+  mutate(Species = case_when(
+                      ID %>% str_detect("A") ~ "Amphiroa anceps",
+                      ID %>% str_detect("J") ~ "Jania rosea",
+                      ID %>% str_detect("M") ~ "Metamastophora flabellata"
+                      ) %>% fct_relevel("Amphiroa anceps")
+         )
+
+TA_data_selection_raw <- TA %$% # these are the unfiltered data (full pH range)
+  bind_rows(X250227_A_16_D, X240621_J_4_D, X241122_M_12_D) %>%
+  mutate(Species = case_when(
+                      ID %>% str_detect("A") ~ "Amphiroa anceps",
+                      ID %>% str_detect("J") ~ "Jania rosea",
+                      ID %>% str_detect("M") ~ "Metamastophora flabellata"
+                      ) %>% fct()
+         )
+
+# Define custom theme
+mytheme <- theme(panel.background = element_blank(),
+                 panel.grid.major = element_blank(),
+                 panel.grid.minor = element_blank(),
+                 panel.border = element_blank(),
+                 plot.margin = margin(0.2, 0.5, 0.2, 0.2, unit = "cm"),
+                 axis.line = element_line(),
+                 axis.title = element_text(size = 12, hjust = 0),
+                 axis.text = element_text(size = 10, colour = "black"),
+                 axis.ticks.length = unit(.25, "cm"),
+                 axis.ticks = element_line(colour = "black", lineend = "square"),
+                 legend.key = element_blank(),
+                 legend.key.width = unit(.25, "cm"),
+                 legend.key.height = unit(.45, "cm"),
+                 legend.key.spacing.x = unit(.5, "cm"),
+                 legend.key.spacing.y = unit(.05, "cm"),
+                 legend.background = element_blank(),
+                 legend.position = "top",
+                 legend.justification = 0,
+                 legend.text = element_text(size = 12, hjust = 0),
+                 legend.title = element_blank(),
+                 legend.margin = margin(0, 0, 0, 0, unit = "cm"),
+                 strip.background = element_blank(),
+                 strip.text = element_text(size = 12, hjust = 0),
+                 panel.spacing = unit(0.6, "cm"),
+                 text = element_text(family = "Futura"))
+
+Fig_S2a <- 
+  TA_data_selection_raw %>%
+    ggplot() +
+      geom_point(aes(mL / (mL + 10) * 100, pH), # re-express added acid as % v/v 
+                 shape = 16, alpha = 0.1) +
+      facet_grid(~ Species) +
+      labs(x = "0.012 M HCl (% v/v)", 
+           y = expression("pH"["F"])) +
+      scale_x_continuous(breaks = seq(16, 28, 3)) +
+      scale_y_continuous(breaks = seq(3, 5, 0.5),
+                         labels = scales::label_number(accuracy = c(1, 0.1, 1, 0.1, 1))) +
+      coord_cartesian(xlim = c(16, 28), ylim = c(3, 5),
+                      clip = "off", expand = FALSE) +
+      mytheme +
+      theme(strip.text = element_text(face = "italic"))
+
+Fig_S2a %>%
+  ggsave(filename = "Fig_S2a.pdf", path = "Figures",
+         width = 22, height = 10, unit = "cm", device = cairo_pdf)
+
+Fig_S2b <- 
+  TA_data_selection_raw %>%
+    ggplot() +
+      geom_point(aes(H_added, H_free),
+                 shape = 16, alpha = 0.1) +
+      facet_grid(~ Species) +
+      labs(x = expression("[H"^"+"*"]"["A"]*" (µM)"), 
+           y = expression("[H"^"+"*"]"["F"]*" (µM)")) +
+      coord_cartesian(xlim = c(2e3, 4.5e3), ylim = c(0, 1.5e3),
+                      clip = "off", expand = FALSE) +
+      mytheme +
+      theme(strip.text = element_text(face = "italic"),
+            panel.spacing = unit(1, "cm"))
+
+Fig_S2b %>%
+  ggsave(filename = "Fig_S2b.pdf", path = "Figures",
+         width = 22, height = 10, unit = "cm", device = cairo_pdf)
+
+Fig_S2c <- 
+  TA_data_selection %>%
+    ggplot() +
+      geom_point(aes(H_added, H_free),
+                 shape = 16, alpha = 0.1) +
+      facet_grid(~ Species) +
+      labs(x = expression("[H"^"+"*"]"["A"]*" (µM)"), 
+           y = expression("[H"^"+"*"]"["F"]*" (µM)")) +
+      coord_cartesian(xlim = c(2e3, 4.5e3), ylim = c(0, 1.5e3),
+                      clip = "off", expand = FALSE) +
+      mytheme +
+      theme(strip.text = element_text(face = "italic"),
+            panel.spacing = unit(1, "cm"))
+
+Fig_S2c %>%
+  ggsave(filename = "Fig_S2c.pdf", path = "Figures",
+         width = 22, height = 10, unit = "cm", device = cairo_pdf)
+
+Fig_S2d <- 
+  TA_predictions_summary_selection %>%
+    ggplot() +
+      geom_point(data = TA_data_selection, 
+                 aes(H_added, H_free),
+                 shape = 16, alpha = 0.1) +
+      geom_line(data = . %>% filter(distribution == "posterior"),
+                aes(H_added, mu_y), linewidth = 0.2) +
+      geom_ribbon(data = . %>% filter(distribution == "posterior"), 
+                  aes(H_added, ymin = mu_ymin, ymax = mu_ymax,
+                      alpha = factor(mu_.width))) +
+      scale_alpha_manual(values = c(0.5, 0.4, 0.3), guide = "none") +
+      facet_grid(~ Species) +
+      labs(x = expression("[H"^"+"*"]"["A"]*" (µM)"), 
+           y = expression("[H"^"+"*"]"["F"]*" (µM)")) +
+      coord_cartesian(xlim = c(2e3, 4.5e3), ylim = c(0, 1.5e3),
+                      clip = "off", expand = FALSE) +
+      mytheme +
+      theme(strip.text = element_text(face = "italic"),
+            panel.spacing = unit(1, "cm"))
+
+Fig_S2d %>%
+  ggsave(filename = "Fig_S2d.pdf", path = "Figures",
+         width = 22, height = 10, unit = "cm", device = cairo_pdf)
+
+# 2.5 Standard model ####
+# Priors as above
+# 2.5.1 Run model ####
+TA_standard_stan <- "
+data{
+  int n;
+  vector<lower=0>[n] H_free;
+  vector<lower=0>[n] H_added;
+  array[n] int ID;
+  int n_ID;
+}
+
+parameters{
+  // Hyperparameters
+  real<lower=0> TA_mu;
+  real<lower=0> TA_sigma;
+  
+  // Titration-specific parameters
+  vector<lower=0>[n_ID] TA;
+  vector<lower=0>[n_ID] beta;
+  
+  // Likelihood uncertainty
+  real<lower=0> sigma;
+}
+
+model{
+  // Hyperpriors
+  TA_mu ~ gamma( 2300^2 / 500^2 , 2300 / 500^2 ); // reparameterised with mean and sd
+  TA_sigma ~ exponential( 1 );
+  
+  // Titration-specific priors
+  TA ~ gamma( TA_mu^2 / TA_sigma^2 , TA_mu / TA_sigma^2 ); 
+  beta ~ gamma( 1^2 / 0.5^2 , 1 / 0.5^2 );
+  
+  // Likelihood uncertainty prior
+  sigma ~ exponential( 1 );
+
+  // Model
+  vector[n] mu;
+  for ( i in 1:n ) {
+      mu[i] = beta[ID[i]] * ( H_added[i] - TA[ID[i]] );
+  }
+
+  // Likelihood
+  H_free ~ normal( mu , sigma );
+}
+"
+
+TA_standard_mod <- TA_standard_stan %>%
+  write_stan_file() %>%
+  cmdstan_model()
+
+TA_standard_samples <- TA_standard_mod$sample(
+  data = TA_standard_data %>%
+    select(H_free, H_added, ID) %>%
+    compose_data(),
+  chains = 8,
+  parallel_chains = parallel::detectCores(),
+  iter_warmup = 1e4,
+  iter_sampling = 1e4)
+
+# 2.5.2 Model checks ####
+TA_standard_samples$summary() %>%
+  mutate(rhat_check = rhat > 1.001) %>%
+  summarise(rhat_1.001 = sum(rhat_check) / length(rhat), # proportion > 1.001
+            rhat_mean = mean(rhat),
+            rhat_sd = sd(rhat),
+            ess_mean = mean(ess_bulk),
+            ess_sd = sd(ess_bulk))
+# no rhat above 1.001
+# good effective sample size
+
+TA_standard_samples$draws(format = "df") %>%
+  mcmc_rank_overlay() %>%
+  ggsave(filename = "TA_standard_rank.pdf", path = "Plots",
+         width = 40, height = 20, unit = "cm", device = cairo_pdf)
+# chains look good
+
+TA_standard_samples$draws(format = "df") %>%
+  mcmc_pairs(pars = c("beta[1]", "TA[1]"))
+TA_standard_samples$draws(format = "df") %>%
+  mcmc_pairs(pars = c("beta[10]", "TA[10]"))
+# parameters are somewhat correlated but this is not an issue for the sampler
+
+# 2.5.3 Prior-posterior comparison ####
+# sample priors
+TA_standard_prior <- prior_samples(
+  model = TA_standard_mod,
+  data = TA_standard_data %>%
+    select(H_free, H_added, ID) %>%
+    compose_data(),
+  chains = 8, samples = 1e4)
+
+# plot prior-posterior comparison
+TA_standard_prior %>%
+  prior_posterior_draws(posterior_samples = TA_standard_samples,
+                        group = TA_standard_data %>% select(ID),
+                        parameters = c("beta[ID]", "TA[ID]",
+                                       "TA_mu", "TA_sigma", 
+                                       "sigma"),
+                        format = "long") %>%
+  prior_posterior_plot(group_name = "ID", ridges = FALSE) %>%
+  ggsave(filename = "TA_standard_prior_posterior.pdf", path = "Plots",
+         width = 80, height = 40, unit = "cm", device = cairo_pdf)
+# posteriors are very well constrained
+
+# 2.5.4 Predictions ####
+# Split grouped tibble into list of tibbles for smoother computation
+TA_standard_data_list <- TA_standard_data %>%
+  group_by(ID) %>%
+  group_split() %>%
+  set_names(
+    map(., ~ .x %$% 
+          as.character(ID) %>% 
+          unique()
+    )
+  )
+
+TA_standard_prior_posterior_list <- TA_standard_prior %>%
+  prior_posterior_draws(posterior_samples = TA_standard_samples,
+                        group = TA_standard_data %>% select(ID),
+                        parameters = c("beta[ID]", "TA[ID]", "sigma"),
+                        format = "short") %>%
+  group_by(ID) %>%
+  group_split() %>%
+  set_names(
+    map(., ~ .x %$% 
+          as.character(ID) %>% 
+          unique()
+        )
+  )
+
+TA_standard_predictions_list <- TA_standard_prior_posterior_list %>%
+  map2(TA_standard_data_list,
+       ~ .x %>% expand_grid(H_added = .y %$%
+                              seq(.x %>% # lower bound is minimum x-intercept
+                                    filter(distribution == "posterior") %$%
+                                    min(TA), 
+                                  max(H_added), # upper bound is maximum [H+]
+                                  length.out = 15))
+       ) %>%
+  map(~ .x %>%
+        mutate(mu = beta * ( H_added - TA ),
+               obs = rnorm( n(), mu, sigma ))
+      )
+
+TA_standard_predictions_summary <- TA_standard_predictions_list %>%
+  map(~ .x %>%
+        group_by(ID, distribution, H_added) %>%
+        reframe(mu = mu %>% mean_qi(.width = c(.5, .8, .9)),
+                obs = obs %>% mean_qi(.width = c(.5, .8, .9))) %>%
+        unnest(c(mu, obs), names_sep = "_")
+      ) %>%
+  bind_rows()
+
+# Remove raw predictions because they are too big
+rm(TA_standard_data_list, TA_standard_prior_posterior_list, TA_standard_predictions_list) 
+
+ggsave(
+  TA_standard_predictions_summary %>%
+    ggplot() +
+      geom_hline(yintercept = 0) +
+      geom_point(data = TA_standard_data, 
+                 aes(H_added, H_free),
+                 shape = 16, alpha = 0.1) +
+      geom_line(data = . %>% filter(distribution == "posterior"),
+                aes(H_added, mu_y)) +
+      geom_ribbon(data = . %>% filter(distribution == "posterior"),
+                  aes(H_added, ymin = mu_ymin, ymax = mu_ymax,
+                      alpha = factor(mu_.width))) +
+      # geom_ribbon(data = . %>% filter(distribution == "posterior"), # unhash to check
+      #             aes(H_added, ymin = obs_ymin, ymax = obs_ymax, # predicted observations
+      #                 alpha = factor(obs_.width))) +
+      # geom_ribbon(data = . %>% filter(distribution == "prior", mu_.width == 0.9),
+      #             aes(H_added, ymin = mu_ymin, ymax = mu_ymax), # unhash to check prior
+      #                 colour = alpha("black", 0.3), fill = NA) +
+      scale_alpha_manual(values = c(0.5, 0.4, 0.3), guide = "none") +
+      facet_wrap(~ ID, scales = "free") +
+      theme_minimal() +
+      theme(panel.grid = element_blank()),
+  filename = "TA_standard_prediction.pdf", path = "Plots",
+  width = 40, height = 20, unit = "cm", device = cairo_pdf)
+# Linear model fits well in all cases.
+
+# 3. Salvage failed TA ####
+# Summarise salvageable titration data
+TA_salvaged <- TA_fails %>%
+  bind_rows() %>%
+  filter(ID != "A_9_L") %>% # filter out measurement that had no acid added
+  group_by(ID) %>%
+  summarise(pH = mean(pH), # summarise overacidified pH measurements
+            mL = mean(mL),
+            Temp = unique(Temp),
+            pH_initial = unique(pH_initial),
+            HCl_M = unique(HCl_M)) %>%
+  mutate(H_free = ( 10 + mL ) * 1e3 * 10^-pH / 0.01, # apply Gran function as before
+         H_added = mL * HCl_M * 1e3 / 0.01)
+
+TA_salvaged
+
+# Estimate TA using hyperparameters
+# The linear equation used before is H_free = beta * ( H_added - TA ), which solved 
+# for TA becomes TA = H_added - H_free / beta. In overacidified samples H_added and 
+# H_free are measured for a point beyond the endpoint of pH 3, and a global beta can
+# be estimated using the hyperparameters beta_mu and beta_sigma, so we have all the
+# ingredients to estimate TA with the adequate uncertainty.
+
+TA_salvaged %<>%
+  cross_join(
+    TA_samples %>%
+      spread_draws(beta_mu, beta_sigma) %>% # estimate grand mean for beta
+      mutate(beta = rgamma( n() , beta_mu^2 / beta_sigma^2 , beta_mu / beta_sigma^2 ))
+    ) %>%
+  mutate(TA = H_added - H_free / beta) %>% # calculate TA as describe above
+  select(ID, Temp, pH_initial, starts_with("."), TA)
+
+TA_salvaged
+
+# Combine all pH and TA data
+pH_TA <- TA_data %>%
+  group_by(ID) %>%
+  summarise(Temp = unique(Temp),
+            pH_initial = unique(pH_initial)) %>%
+  left_join(
+    TA_samples %>%
+      recover_types(TA_data %>% select(ID)) %>%
+      spread_draws(TA[ID]),
+    by = "ID"
+  ) %>%
+  bind_rows(TA_salvaged)
+
+# Check that merges worked correctly
+pH_TA %>%
+  group_by(ID) %>%
+  summarise(Temp = unique(Temp),
+            pH_initial = unique(pH_initial),
+            TA = mean(TA)) %>%
+  print(n = 169)
+
+# 4. Conversion ####
+# 4.1 Correct TA with standard ####
+# The standard used is Scripps Institution of Oceanography CRM #205 - 0344
+# with the following properties:
+# Salinity = 33.443‰
+# TA = 2202.05 ± 0.98 μmol kg^–1 (mean ± s.d.)
+# DIC = 2011.85 ± 0.99 μmol kg^–1 (mean ± s.d.)
+# Known TA is given in µmol kg^-1 rather than µM, so needs to be converted
+# to µM by multiplying by seawater density (kg L^-1), 
+# i.e. µmol kg^-1 * kg L^-1 = µmol L^-1 = µM.
+
+require(seacarb)
+TA_standard <- TA_standard_samples %>%
+  spread_draws(TA_mu, TA_sigma) %>%
+  mutate(TA_measured = rgamma( n() , TA_mu^2 / TA_sigma^2 , TA_mu / TA_sigma^2 ),
+         kg_L = rho(S = 33.443, T = 25) %>% as.numeric() * 1e-3,
+         TA_true = rnorm( n() , 2202.05 , 0.98 ) * kg_L,
+         TA_ratio = TA_true / TA_measured,
+         TA_diff = TA_measured - TA_true)
+
+TA_standard %>%
+  summarise(across(
+              .cols = c(TA_measured, TA_true, TA_ratio, TA_diff),
+              .fns = list(mean = mean, sd = sd)
+              )) %>%
+  pivot_longer(cols = everything(), names_to = c("variable", "statistic"), 
+               values_to = "value", names_pattern = "^(.*)_(mean|sd)$") %>%
+  pivot_wider(values_from = value, names_from = statistic)
+
+# Subtract difference between measured and expected from sample TA estimates
+pH_TA %<>%
+  left_join(
+    TA_standard %>%
+      select(starts_with("."), TA_diff),
+    by = c(".chain", ".iteration", ".draw")
+  ) %>%
+  mutate(TA_corrected = TA - TA_diff) %>%
+  select(-c(TA, TA_diff))
+
+# 4.2 DIC from pH and TA ####
+# Get salinity data
+incu_meta <- read.csv("Incubation.csv") %>%
+  mutate(ID = ID %>% fct(),
+         Round = Round %>% as.character() %>% fct(),
+         Species = case_when(
+                      is.na(Species) & ID %>% str_detect("^0") ~ "Initial",
+                      is.na(Species) & ID %>% str_detect("B") ~ "Blank",
+                      TRUE ~ Species
+                      ) %>% fct_relevel("Initial", "Blank", "Amphiroa anceps"),
+         Treatment = Treatment %>% fct())
+  
+pH_TA %<>%
+  left_join(
+    incu_meta %>% 
+      left_join(
+        incu_meta %>% 
+          filter(Species == "Initial") %>%
+          select(Round, Treatment, Salinity) %>%
+          rename(Salinity_initial = Salinity),
+        by = c("Round", "Treatment")
+      ) %>%
+      select(ID, Round, Species, Treatment, Salinity, Salinity_initial),
+    by = "ID"
+    )
+
+# Calculate DIC
+DIC_TA <- pH_TA %>% # seacarb::carb() takes TA in mol kg^-1,
+  mutate(kg_L = rho(S = Salinity, T = Temp) %>% as.numeric() * 1e-3,
+         DIC_calculated = carb(flag = 8, 
+                               var1 = pH_initial, # so the input needs to be converted from µM to mol kg^-1
+                               var2 = TA_corrected * 1e-6 / kg_L,
+                               S = Salinity, 
+                               T = Temp, # and the output needs to be back-converted from mol kg^-1 to µM
+                               pHscale = "F")$DIC * 1e6 * kg_L)
+
+# Check success of calculation
+DIC_TA %>%
+  group_by(ID) %>%
+  summarise(Temp = mean(Temp),
+            pH_initial = mean(pH_initial),
+            TA_corrected = mean(TA_corrected),
+            Salinity = mean(Salinity),
+            kg_L = mean(kg_L),
+            DIC_calculated = mean(DIC_calculated)) %>%
+  print(n = 169)
+# Looks fine
+
+rm(pH_TA)
+
+# 4.3 TA vs. DIC ####
+# Viusalise TA and DIC using Deffeyes diagram
+# Generate values for pCO2 contours with µM TA and DIC input
+pCO2_contour <- DIC_TA %$% # simulate TA and DIC based on empirical TA and DIC ranges in µM
+  expand_grid(TA_sim = seq(floor( min(TA_corrected) / 100 ) * 100, # round down to nearest 100
+                           ceiling( max(TA_corrected) / 100 ) * 100, # round up to nearest 100
+                           length.out = 1e3),
+              DIC_sim = seq(floor( min(DIC_calculated) / 100 ) * 100,
+                            ceiling( max(DIC_calculated) / 100 ) * 100,
+                            length.out = 1e3)) %>%
+  mutate(kg_L = DIC_TA %$% rho(S = mean(Salinity), T = unique(Temp)) %>% as.numeric() * 1e-3, # calculate mean kg L^-1
+         pCO2_sim = carb(flag = 15, # convert µM * 1e-6 = M and M / kg L^-1 = mol L^-1 * L kg^-1 = mol kg^-1
+                         var1 = TA_sim * 1e-6 / kg_L, # pH does not factor in the calculation, so no pH scale defined
+                         var2 = DIC_sim * 1e-6 / kg_L, 
+                         S = DIC_TA %$% mean(Salinity), # DIC_TA is specified here rather than outside carb() because 
+                         T = DIC_TA %$% unique(Temp))$pCO2) # it also has a variable called kg_L
+
+require(geomtextpath)
+require(ggdensity)
+Fig_S3 <- DIC_TA %>%
+  ggplot() +
+    geom_textcontour(data = pCO2_contour, aes(x = DIC_sim, y = TA_sim, z = log10(pCO2_sim)),
+                     breaks = c(seq(-2.5, 4, 0.5), 4.2, seq(4.4, 5, 0.1)), colour = "#c9d2d7",
+                     size = 3.5, family = "Futura") + # 3.5 is equivalent to 10 pt
+    geom_hdr(data = . %>%
+               group_by(ID) %>% # randomly reshuffle within ID
+               mutate(DIC_calculated = DIC_calculated %>% sample(),
+                      Modified = if_else(
+                                  Species %in% c("Blank", "Initial"),
+                                  "Control", "Coralline"
+                                  )
+                      ),
+             aes(DIC_calculated, TA_corrected, fill = Modified, group = ID),
+             alpha = 0.5, n = 500, method = "mvnorm", probs = 0.999) +
+    geom_hline(yintercept = Inf, lineend = "square") +
+    geom_vline(xintercept = Inf) +
+    annotate("segment", x = 2700, y = 1700, xend = 2700 + 500, yend = 1700 + 500 * 2,
+             linewidth = 0.5, lineend = "square", linejoin = "mitre",
+             arrow = arrow(angle = 20, length = unit(0.3, "cm"), ends = "both", type = "closed")) +
+    annotate("segment", x = 2700, y = 2200, xend = 2700 + 500, yend = 2200,
+             linewidth = 0.5, lineend = "square", linejoin = "mitre",
+             arrow = arrow(angle = 20, length = unit(0.3, "cm"), ends = "both", type = "closed")) +
+    annotate("label", x = 330, y = 3300, label = "italic(p)*'CO'[2]*' (log'[10]*' µatm)'", 
+             parse = TRUE, colour = "#c9d2d7", family = "Futura", size = 3.5, hjust = 0,
+             label.size = 0) +
+    scale_fill_manual(values = c("#5bb5b5", "#bc90c1")) +
+    scale_x_continuous(breaks = pCO2_contour %$% seq(min(DIC_sim), max(DIC_sim), 300)) +
+    scale_y_continuous(breaks = pCO2_contour %$% seq(min(TA_sim), max(TA_sim), 300)) +
+    labs(x = expression("C"["T"]*" (µM)"), y = expression("A"["T"]*" (µM)")) +
+    coord_cartesian(xlim = pCO2_contour %$% c(min(DIC_sim), max(DIC_sim)), 
+                    ylim = pCO2_contour %$% c(min(TA_sim), max(TA_sim)),
+                    expand = FALSE, clip = "off") +
+    mytheme
+
+Fig_S3 %>%
+  ggsave(filename = "Fig_S3.pdf", path = "Figures",
+         width = 22, height = 10, unit = "cm", device = cairo_pdf)
+
+# 4.4 ΔTA and ΔDIC ####
+DIC_TA %<>% 
+  rename(TA = TA_corrected, DIC = DIC_calculated) %>%
+  select(-c(pH_initial, Temp)) %>% # pH and titration temperature are no longer needed
+  filter(Species != "Initial") %>%
+  mutate(Species = Species %>% fct_drop(),
+         ID = ID %>% fct_drop()) %>%
+  left_join( # join initial and blank/coralline final samples horizontally
+    DIC_TA %>%
+      filter(Species == "Initial") %>%
+      rename(TA_initial = TA_corrected, DIC_initial = DIC_calculated) %>%
+      select(starts_with("."), Round, Treatment, TA_initial, DIC_initial),
+    by = c(".chain", ".iteration", ".draw", "Round", "Treatment")
+  ) %>%
+  mutate(delta_TA_µM_h = (TA - TA_initial) / 2, # calculate ΔTA and ΔDIC in µM h^-1
+         delta_DIC_µM_h = (DIC - DIC_initial) / 2) %>%
+  select(-c(TA, DIC))
+
+DIC_TA
+
+# 4.5 Volume ####
+# See details in Oxygen.R under 4.2 Volume.
+# 4.5.1 Prepare data ####
+V <- incu_meta %>%
+  filter(!is.na(Volume)) %>%
+  mutate(Species = Species %>% fct_drop()) %>%
+  select(ID, Species, Treatment, Volume)
+
+# 4.5.2 Prior simulation ####
+ggplot() +
+  geom_density(aes(rgamma(1e5, 175^2 / 10^2, 175 / 10^2))) + # 10 mL seems like a reasonable sd
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+
+# 4.5.3 Run model ####
+V_stan <- "
+data{
+  int n;
+  vector<lower=0>[n] Volume;
+  array[n] int Species;
+  int n_Species;
+  array[n] int Treatment;
+  int n_Treatment;
+}
+
+parameters{
+  matrix<lower=0>[n_Species, n_Treatment] V_mu;
+  real<lower=0> sigma;
+}
+
+model{
+  to_vector(V_mu) ~ gamma( 175^2 / 10^2 , 175 / 10^2 );
+  sigma ~ exponential( 1 );
+  
+  // Model
+  vector[n] mu;
+  for ( i in 1:n ) {
+    mu[i] = V_mu[Species[i], Treatment[i]];
+  }
+
+  // Likelihood
+  Volume ~ normal( mu , sigma );
+}
+"
+
+V_mod <- V_stan %>%
+  write_stan_file() %>%
+  cmdstan_model()
+
+V_samples <- V_mod$sample(
+    data = V %>% 
+      select(Species, Treatment, Volume) %>%
+      compose_data(),
+    chains = 8,
+    parallel_chains = parallel::detectCores(),
+    iter_warmup = 1e4,
+    iter_sampling = 1e4)
+
+# 4.5.4 Model checks ####
+V_samples$summary() %>%
+  mutate(rhat_check = rhat > 1.001) %>%
+  summarise(rhat_1.001 = sum(rhat_check) / length(rhat), # proportion > 1.001
+            rhat_mean = mean(rhat),
+            rhat_sd = sd(rhat),
+            ess_mean = mean(ess_bulk),
+            ess_sd = sd(ess_bulk))
+# no rhat above 1.001
+# good effective sample size
+
+V_samples$draws(format = "df") %>%
+  mcmc_rank_overlay()
+# chains look fine
+
+# 4.5.5 Prior-posterior comparison ####
+# sample priors
+V_prior <- prior_samples(
+  model = V_mod,
+  data = V %>% 
+    select(Species, Treatment, Volume) %>%
+    compose_data(),
+  chains = 8, samples = 1e4)
+
+# plot prior-posterior comparison
+V_prior %>%
+  prior_posterior_draws(posterior_samples = V_samples,
+                        group = V %>% select(Species, Treatment),
+                        parameters = c("V_mu[Species, Treatment]", "sigma"),
+                        format = "long") %>%
+  ggplot() +
+    geom_density(aes(.value, alpha = distribution),
+                 colour = NA, fill = "black") +
+    scale_alpha_manual(values = c(0.6, 0.2)) +
+    ggh4x::facet_nested(Treatment ~ .variable + Species, 
+                        scales = "free", nest_line = TRUE) +
+    theme_minimal() +
+    theme(panel.grid = element_blank())
+# posteriors are very well constrained
+
+# 4.5.6 Add volume to estimates ####
+DIC_TA %<>%
+  left_join( # match exact volumes
+    V, by = c("ID", "Species", "Treatment")
+  ) %>%
+  left_join( # match estimated volumes
+    V_samples %>%
+      recover_types(V %>% select(Species, Treatment)) %>%
+      spread_draws(V_mu[Species, Treatment]) %>%
+      ungroup(),
+    by = c("Species", "Treatment", ".chain", ".iteration", ".draw")
+  ) %>% # merge Volume into one column
+  mutate(Volume = coalesce(Volume, V_mu)) %>%
+  select(-V_mu)
+
+# 4.5.7 Convert volume to L ####
+# The function seacarb::rho() needs temperature and salinity. The temperature measurement
+# needs to be taken wen the water is weighed so I cannot use the titration temperature. The
+# best source of this temperature is that measured by the oxygen meter and can be got from
+# O2_estimates.
+O2_estimates <- read_rds("O2_estimates.rds")
+
+DIC_TA %<>%
+  left_join(
+    O2_estimates %>%
+      select(starts_with("."), Round, T_L, T_D) %>%
+      pivot_longer(cols = c(T_L, T_D),
+                   values_to = "Temp", 
+                   names_to = "Treatment") %>%
+      mutate(Treatment = if_else(Treatment == "T_L",
+                                 "Light", "Dark") %>% 
+                           fct()) %>%
+      distinct(.chain, .iteration, .draw, Round, Treatment, .keep_all = TRUE),
+    by = c(".chain", ".iteration", ".draw", "Round", "Treatment")
+  ) %>%
+  mutate(g_L = rho(S = Salinity, T = Temp) %>% as.numeric(),
+         Volume_L = Volume / g_L)
+
+# 4.5.8 Correct for volume ####
+# Multiplying ΔTA h^-1 and ΔDIC h^-1 by Volume_L converts them from µM h^-1 to µmol h^-1 because
+# µM h^-1 is equivalent to µmol L^-1 h^-1, which * L leaves µmol h^-1.
+DIC_TA %<>%
+  mutate(delta_TA_µmol_h = delta_TA_µM_h * Volume_L,
+         delta_DIC_µmol_h = delta_DIC_µM_h * Volume_L) %>%
+  select(-c(delta_TA_µM_h, delta_DIC_µM_h, Volume, Volume_L, 
+            kg_L, g_L, Temp))
+
+# 4.6 Blank correction ####
+DIC_TA %<>% 
+  filter(Species != "Blank") %>%
+  mutate(Species = Species %>% fct_drop(),
+         ID = ID %>% fct_drop()) %>%
+  left_join( # join blank and coralline samples horizontally
+    DIC_TA %>%
+      filter(Species == "Blank") %>%
+      rename(delta_TA_µmol_h_blank = delta_TA_µmol_h, delta_DIC_µmol_h_blank = delta_DIC_µmol_h) %>%
+      select(starts_with("."), Round, Treatment, delta_TA_µmol_h_blank, delta_DIC_µmol_h_blank),
+    by = c(".chain", ".iteration", ".draw", "Round", "Treatment")
+  ) %>%
+  mutate(delta_TA_µmol_h_corrected = delta_TA_µmol_h - delta_TA_µmol_h_blank, # subtract blank
+         delta_DIC_µmol_h_corrected = delta_DIC_µmol_h - delta_DIC_µmol_h_blank) %>%
+  select(-c(delta_TA_µmol_h, delta_TA_µmol_h_blank, delta_DIC_µmol_h, delta_DIC_µmol_h_blank))
+
+# 4.7 Mass ####
+# 4.7.1 Add mass estimates ####
+mass <- read.csv("Mass.csv") %>%
+  select(ID, Species, DM) %>%
+  mutate(ID = ID %>% fct(),
+         Species = Species %>% fct()) %>%
+  rename(Individual = ID,
+         Mass = DM)
+
+DIC_TA %<>%
+  mutate(Individual = ID %>% str_sub(end = -3) %>% fct()) %>% # remove Treatment from ID
+  left_join(mass, by = c("Individual", "Species")) # join mass by short ID
+
+# 4.7.2 Correct for mass ####
+# ΔTA and ΔDIC are currently given as µmol h^-1, but I want it as µmol g^-1 h^-1, so
+# I need to divide by dry mass (g).
+DIC_TA %<>%
+  mutate(delta_TA_µmol_g_h = delta_TA_µmol_h_corrected / Mass,
+         delta_DIC_µmol_g_h = delta_DIC_µmol_h_corrected / Mass,
+         Individual = Individual %>% str_sub(start = 3) %>% fct()) %>% # remove Species from Individual
+  select(-c(delta_TA_µmol_h_corrected, delta_DIC_µmol_h_corrected))
+
+# 4.8 G, P and R ####
+# 4.8.1 Calculate G and CO2 fixation ####
+C_estimates <- DIC_TA %>%
+  mutate(G = -delta_TA_µmol_g_h / 2, # G is inversely related to TA and frees up 2 protons per CaCO3
+         CO2_fix = -delta_DIC_µmol_g_h - G, # some C is fixed by G instead of P and this needs to be subtracted
+         ID = ID %>% str_sub(end = -3) %>% fct()) %>% # remove Treatment from ID
+  select(-c(delta_TA_µmol_g_h, delta_DIC_µmol_g_h)) %>%
+  rename(S = Salinity, S_0 = Salinity_initial, TA = TA_initial, DIC = DIC_initial)
+
+# 4.8.2 Separate G and D and P and R ####
+C_estimates %<>%
+  pivot_wider(names_from = Treatment,
+              values_from = c(G, CO2_fix, TA, DIC, S, S_0)) %>%
+  rename(G = G_Light,
+         G_D = G_Dark,
+         nP = CO2_fix_Light,
+         nP_D = CO2_fix_Dark,
+         TA_L = TA_Light,
+         TA_D = TA_Dark,
+         DIC_L = DIC_Light,
+         DIC_D = DIC_Dark,
+         S_L = S_Light,
+         S_D = S_Dark,
+         S_0_L = S_0_Light,
+         S_0_D = S_0_Dark) %>%
+  mutate(D = -G_D, # dissolution is the inverse of calcification
+         R = -nP_D, # respiration is the inverse of net photosynthesis
+         gP = nP + R, # add net photosynthesis and respiration to get gross photosynthesis
+         # gross calcification cannot be calculated because we cannot assume that dissolution
+         # is equal in dark and light; in fact we know that respiration enhances dissolution
+         TA_LD = (TA_L + TA_D) / 2, # calculate the mean of all confounders that vary between
+         DIC_LD = (DIC_L + DIC_D) / 2, # light and dark incubations
+         S_LD = (S_L + S_D) / 2,
+         S_0_LD = (S_0_L + S_0_D) / 2) %>%
+  select(-c(G_D, nP_D))
+
+str(C_estimates)
+
+# 4.8.3 Clean up ####
+rm(list = setdiff(ls(), "C_estimates"))
+
+# 4.8.4 Save estimates ####
+C_estimates %>% write_rds("C_estimates.rds")
