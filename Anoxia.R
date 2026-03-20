@@ -183,6 +183,12 @@ NH4_Exp2 <- TA %>%
          Flask = Flask %>% as_factor()) %T>%
   print()
 
+NH4_Exp2 %>%
+  ggplot(aes(Day, NH4_uM, colour = Treatment)) +
+    geom_point(shape = 16, size = 2.5, alpha = 0.5) +
+    geom_line(aes(group = Flask)) +
+    mytheme
+
 # 2.1.2 Stan model ####
 require(cmdstanr)
 TA_model <- here("Alkalinity", "Stan", "TA_Exp2.stan") %>% 
@@ -316,14 +322,150 @@ TA_prediction <- TA_prior_posterior %>%
 TA_prediction %>%
   write_rds(here("Alkalinity", "RDS", "TA_prediction.rds"))
 
+
+# 2.1.2 Stan model ####
+NH4_model <- here("Alkalinity", "Stan", "NH4_Exp2.stan") %>% 
+  read_file() %>%
+  write_stan_file() %>%
+  cmdstan_model()
+
+NH4_samples <- NH4_model$sample(
+          data = NH4_Exp2 %>%
+            select(Day, NH4_uM, Treatment, Flask) %>%
+            rename(NH4 = NH4_uM) %>%
+            compose_data(),
+          chains = 8,
+          parallel_chains = parallel::detectCores(),
+          iter_warmup = 1e4,
+          iter_sampling = 1e4
+        ) %T>%
+  print()
+
+# Save draws
+NH4_samples$draws() %>%
+  write_rds(here("Alkalinity", "RDS", "NH4_samples.rds"))
+NH4_samples$draws(format = "df") %>%
+  write_rds(here("Alkalinity", "RDS", "NH4_samples_df.rds"))
+
+# 2.1.3 Model checks ####
+# Rhat
+NH4_samples$summary() %>%
+  summarise(rhat_1.001 = mean( rhat > 1.001 ),
+            rhat_mean = mean(rhat),
+            rhat_sd = sd(rhat))
+# No rhat above 1.001. rhat = 1.00 ± 0.000138.
+
+# Chains
+NH4_samples$draws(format = "df") %>%
+  mcmc_rank_overlay()
+
+# Pairs
+NH4_samples$draws(format = "df") %>%
+  mcmc_pairs(pars = c("log_NH4_base", "log_NH4_prod_mu", 
+                      "log_r_mu", "log_m_mu"))
+# No correlation between logistic parameters
+
+NH4_samples$draws(format = "df") %>%
+  mcmc_pairs(pars = c("log_NH4_prod_T[1]", "log_NH4_prod_F[1]",
+                      "log_NH4_prod_T[2]", "log_NH4_prod_F[2]"))
+NH4_samples$draws(format = "df") %>%
+  mcmc_pairs(pars = c("log_r_T[1]", "log_r_F[1]",
+                      "log_r_T[2]", "log_r_F[2]"))
+NH4_samples$draws(format = "df") %>%
+  mcmc_pairs(pars = c("log_m_T[1]", "log_m_F[1]",
+                      "log_m_T[2]", "log_m_F[2]"))
+# Strong correlation between flasks and treatments, meaning they are hardly
+# distinguishable, especially for m. Nonetheless, I choose this as the
+# optimal model.
+
+# 2.1.4 Prior-posterior comparison ####
+NH4_prior <- prior_samples(
+  model = NH4_model,
+  data = NH4_Exp2 %>%
+    select(Day, NH4_uM, Treatment, Flask) %>%
+    rename(NH4 = NH4_uM) %>%
+    compose_data()
+)
+
+NH4_prior %>% 
+  prior_posterior_draws(
+    posterior_samples = NH4_samples,
+    group = NH4_Exp2 %>% select(Treatment, Flask),
+    parameters = c("log_NH4_base", "log_NH4_prod_mu", "log_r_mu", "log_m_mu", "theta", 
+                   "log_NH4_prod_T[Treatment]", "log_r_T[Treatment]", "log_m_T[Treatment]",
+                   "log_NH4_prod_F[Flask]", "log_r_F[Flask]", "log_m_F[Flask]",
+                   "log_NH4_prod_T_sigma", "log_r_T_sigma", "log_m_T_sigma",
+                   "log_NH4_prod_F_sigma", "log_r_F_sigma", "log_m_F_sigma"),
+    format = "long"
+    ) %>%
+  prior_posterior_plot(
+    group_name = "Treatment",
+    second_group_name = "Flask"
+  )
+
+
+# 2.1.5 Parameters ####
+NH4_prior_posterior <- NH4_prior %>% 
+  prior_posterior_draws(
+    posterior_samples = NH4_samples,
+    group = NH4_Exp2 %>% select(Treatment),
+    parameters = c("log_NH4_base", "theta", "log_NH4_prod_T[Treatment]",
+                   "log_r_T[Treatment]", "log_m_T[Treatment]",
+                   "log_NH4_prod_F_sigma", "log_r_F_sigma", "log_m_F_sigma"),
+    format = "short"
+  ) %>% 
+  mutate( # Calculate parameters for new flasks
+    NH4_base = exp( log_NH4_base ),
+    NH4_prod = exp( rnorm( n() , log_NH4_prod_T , log_NH4_prod_F_sigma ) ),
+    r = exp( rnorm( n() , log_r_T , log_r_F_sigma ) ),
+    m = exp( rnorm( n() , log_m_T , log_m_F_sigma ) )
+  ) %>%
+  filter(Treatment == "Control" & distribution == "prior" |
+           distribution == "posterior") %>%
+  mutate(
+    Treatment = if_else(
+      distribution == "prior", "Prior", Treatment
+    ) %>% fct()
+  ) %>%
+  select(starts_with("."), Treatment, NH4_base, 
+         NH4_prod, r, m, theta, log_NH4_prod_F_sigma) %T>%
+  print()
+
+
+# Save parameter distributions
+NH4_prior_posterior %>%
+  write_rds(here("Alkalinity", "RDS", "NH4_prior_posterior.rds"))
+
+# 2.1.6 Prediction ####
+NH4_prediction <- NH4_prior_posterior %>%
+  spread_continuous(
+    data = NH4_Exp2,
+    predictor_name = "Day",
+    group_name = "Treatment"
+  ) %>%
+  mutate( 
+    mu = NH4_prod * plogis( r * ( Day - m ) ) + NH4_base,
+    NH4 = rgamma( n() , mu / theta , 1 / theta )
+  ) %>%
+  group_by(Treatment, Day) %>%
+  median_qi(mu, NH4, .width = c(.5, .8, .9)) %T>%
+  print()
+
+NH4_prediction %>%
+  write_rds(here("Alkalinity", "RDS", "NH4_prediction.rds"))
+
+
 # Figures
-# Proportion over time
+# Concentration over time
 Fig_1a <- TA_prediction %>%
   filter(Treatment != "Prior") %>%
   ggplot() +
     geom_point(data = TA_Exp2,
                aes(Day, TA / 1e3, colour = Treatment), 
                shape = 16, size = 2.5, alpha = 0.7) +
+    # geom_line(data = TA_Exp2,
+    #           aes(Day, TA / 1e3, group = Flask, colour = Treatment),
+    #           alpha = 0.7) + 
     geom_line(aes(Day, TA / 1e3, colour = Treatment)) +
     geom_ribbon(aes(Day, ymin = TA.lower / 1e3, 
                     ymax = TA.upper / 1e3,
@@ -340,7 +482,9 @@ Fig_1a <- TA_prediction %>%
          y = "Total alkalinity (mM)") +
     coord_cartesian(xlim = c(0, 240), ylim = c(0, 80), 
                     expand = FALSE, clip = "off") +
-    mytheme
+    mytheme +
+    # Strip text creates a lot of space
+    theme(plot.margin = margin(0, 0.5, 0.2, 0.2, unit = "cm"))
 
 Fig_1a
 
@@ -365,6 +509,7 @@ Fig_1b <- TA_prior_posterior %>%
           axis.ticks.y = element_blank(),
           axis.text.y = element_blank(),
           strip.text = element_blank(),
+          axis.title.x = element_text(margin = margin(t = 0)), # counteract superscript
           plot.margin = margin(0.2, 0.5, 0, 0.2, unit = "cm"))
 
 Fig_1b
@@ -393,17 +538,38 @@ Fig_1c <- TA_prior_posterior %>%
 Fig_1c
 
 # Produced TA
+# When scales are different a slightly different approach is needed:
+# 1. facet_wrap to give treatments different distribution heights
+# 2. facetted_pos_scales to give treatments different scales
+# 3. stat_density_ridges to give treatments different bandwidths
+
+require(ggh4x)
+require(ggridges)
 Fig_1d <- TA_prior_posterior %>%
   filter(Treatment != "Prior") %>%
+  mutate(Treatment = Treatment %>% fct_relevel("Blank", "Control", "Sulfate")) %>%
   ggplot() +
-    geom_density(aes(TA_prod / 1e3, fill = Treatment),
-                 n = 2^10, bw = 90 * 0.02, colour = NA) +
-    scale_fill_manual(values = c("#627d0e", "#7030a5", "#f1c700", "#6f5229"),
+    stat_density_ridges(aes(TA_prod / 1e3, y = 0, fill = Treatment),
+                        from = 0, to = c(9, rep(90, 3)),
+                        n = 2^10, bandwidth = c(9, rep(90, 3)) * 0.02, 
+                        colour = NA) +
+    scale_fill_manual(values = c("#6f5229", "#627d0e", "#7030a5", "#f1c700"),
                       guide = "none") +
-    scale_x_continuous(limits = c(0, 90),
-                       breaks = seq(0, 90, 30),
-                       oob = scales::oob_keep) +
-    facet_grid(~ Treatment %>% fct_relevel("Blank", "Control", "Sulfate")) +
+    facet_wrap(~ Treatment, scales = "free", nrow = 1) +
+    facetted_pos_scales(
+      x = list(
+        Treatment == "Blank" ~ scale_x_continuous(
+          limits = c(0, 9),
+          breaks = seq(0, 9, 3),
+          oob = scales::oob_keep
+        ),
+        Treatment != "Blank" ~ scale_x_continuous(
+          limits = c(0, 90),
+          breaks = seq(0, 90, 30),
+          oob = scales::oob_keep
+        )
+      )
+    ) +
     labs(x = "Produced total alkalinity (mM)") +
     coord_cartesian(expand = FALSE, clip = "off") +
     mytheme +
@@ -412,6 +578,7 @@ Fig_1d <- TA_prior_posterior %>%
           axis.ticks.y = element_blank(),
           axis.text.y = element_blank(),
           strip.text = element_blank(),
+          # Space needed on top because all denisties have same height
           plot.margin = margin(0.2, 0.5, 0, 0.2, unit = "cm"))
 
 Fig_1d
@@ -524,15 +691,209 @@ Fig_1f
 
 require(patchwork)
 Fig_1 <- ( Fig_1a / Fig_1b / Fig_1c / Fig_1d / Fig_1e / Fig_1f ) +
-          plot_layout(heights = c(1, rep(0.2, 2), 0.6, rep(0.2, 2)))
+          plot_layout(heights = c(1, rep(0.2, 5)))
 Fig_1
 
 Fig_1 %>%
   ggsave(filename = "Fig_1.pdf", path = "Figures",
-         device = cairo_pdf, height = 20, width = 20, units = "cm")
+         device = cairo_pdf, height = 18, width = 20, units = "cm")
 
 
 
+
+# Concentration over time
+Fig_2a <- NH4_prediction %>%
+  filter(Treatment != "Prior") %>%
+  ggplot() +
+    geom_point(data = NH4_Exp2,
+               aes(Day, NH4_uM / 1e3, colour = Treatment), 
+               shape = 16, size = 2.5, alpha = 0.7) +
+    # geom_line(data = NH4_Exp2,
+    #           aes(Day, NH4_uM / 1e3, group = Flask, colour = Treatment),
+    #           alpha = 0.7) + 
+    geom_line(aes(Day, NH4 / 1e3, colour = Treatment)) +
+    geom_ribbon(aes(Day, ymin = NH4.lower / 1e3, 
+                    ymax = NH4.upper / 1e3,
+                    alpha = factor(.width),
+                    fill = Treatment)) +
+    scale_colour_manual(values = c("#627d0e", "#7030a5", "#f1c700", "#6f5229"),
+                        guide = "none") +
+    scale_fill_manual(values = c("#627d0e", "#7030a5", "#f1c700", "#6f5229"),
+                      guide = "none") +
+    scale_alpha_manual(values = c(0.5, 0.4, 0.3), guide = "none") +
+    scale_x_continuous(breaks = seq(0, 240, 60)) +
+    scale_y_continuous(breaks = seq(0, 2.4, 0.6),
+                       labels = scales::label_number(accuracy = c(1, rep(0.1, 4)))) +
+    facet_grid(~ Treatment %>% fct_relevel("Blank", "Control", "Sulfate")) +
+    labs(x = "Time since kelp addition (days)",
+         y = "Ammonium (mM)") +
+    coord_cartesian(xlim = c(0, 240), ylim = c(0, 2.4), 
+                    expand = FALSE, clip = "off") +
+    mytheme +
+    theme(plot.margin = margin(0, 0.5, 0.2, 0.2, unit = "cm"))
+
+Fig_2a
+
+# NH4 production rate
+Fig_2b <- NH4_prior_posterior %>%
+  filter(Treatment != "Prior") %>%
+  ggplot() +
+    geom_density(aes(r, fill = Treatment),
+                 n = 2^10, bw = 0.12 * 0.02, colour = NA) +
+    scale_fill_manual(values = c("#627d0e", "#7030a5", "#f1c700", "#6f5229"),
+                      guide = "none") +
+    scale_x_continuous(limits = c(0, 0.12),
+                       breaks = seq(0, 0.12, 0.04),
+                       labels = scales::label_number(accuracy = c(1, rep(0.01, 3))),
+                       oob = scales::oob_keep) +
+    facet_grid(~ Treatment %>% fct_relevel("Blank", "Control", "Sulfate")) +
+    labs(x = expression("Ammonium production (day"^-1*")")) +
+    coord_cartesian(expand = FALSE, clip = "off") +
+    mytheme +
+    theme(axis.title.y = element_blank(),
+          axis.line.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_blank(),
+          strip.text = element_blank(),
+          axis.title.x = element_text(margin = margin(t = 0)), # counteract superscript
+          plot.margin = margin(0.2, 0.5, 0, 0.2, unit = "cm"))
+
+Fig_2b
+
+# Time of maximal production rate
+Fig_2c <- NH4_prior_posterior %>%
+  filter(Treatment != "Prior") %>%
+  mutate(Treatment = Treatment %>% fct_relevel("Blank", "Control", "Sulfate")) %>%
+  ggplot() +
+    stat_density_ridges(aes(m, y = 0, fill = Treatment),
+                        from = 0, to = c(900, rep(240, 3)),
+                        n = 2^10, bandwidth = c(900, rep(240, 3)) * 0.02, 
+                        colour = NA) +
+    scale_fill_manual(values = c("#6f5229", "#627d0e", "#7030a5", "#f1c700"),
+                      guide = "none") +
+    facet_wrap(~ Treatment, scales = "free", nrow = 1) +
+    facetted_pos_scales(
+      x = list(
+        Treatment == "Blank" ~ scale_x_continuous(
+          limits = c(0, 900),
+          breaks = seq(0, 900, 300),
+          oob = scales::oob_keep
+        ),
+        Treatment != "Blank" ~ scale_x_continuous(
+          limits = c(0, 240),
+          breaks = seq(0, 240, 60),
+          oob = scales::oob_keep
+        )
+      )
+    ) +
+    labs(x = "Time of maximal production (days)") +
+    coord_cartesian(expand = FALSE, clip = "off") +
+    mytheme +
+    theme(axis.title.y = element_blank(),
+          axis.line.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_blank(),
+          strip.text = element_blank(),
+          plot.margin = margin(0.2, 0.5, 0, 0.2, unit = "cm"))
+
+Fig_2c
+
+# Produced NH4
+Fig_2d <- NH4_prior_posterior %>%
+  filter(Treatment != "Prior") %>%
+  ggplot() +
+    geom_density(aes(NH4_prod / 1e3, fill = Treatment),
+                 n = 2^10, bw = 3 * 0.02, colour = NA) +
+    scale_fill_manual(values = c("#627d0e", "#7030a5", "#f1c700", "#6f5229"),
+                      guide = "none") +
+    scale_x_continuous(limits = c(0, 3),
+                       oob = scales::oob_keep) +
+    facet_grid(~ Treatment %>% fct_relevel("Blank", "Control", "Sulfate")) +
+    labs(x = "Produced ammonium (mM)") +
+    coord_cartesian(expand = FALSE, clip = "off") +
+    mytheme +
+    theme(axis.title.y = element_blank(),
+          axis.line.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_blank(),
+          strip.text = element_blank())
+
+Fig_2d
+
+Fig_2 <- ( Fig_2a / Fig_2b / Fig_2c / Fig_2d ) +
+  plot_layout(heights = c(1, rep(0.2, 3)))
+Fig_2
+
+18/2*1.6 # 14.4 cm height, round down because fewer titles/space
+
+Fig_2 %>%
+  ggsave(filename = "Fig_2.pdf", path = "Figures",
+         device = cairo_pdf, height = 14, width = 20, units = "cm")
+
+# Figure S1
+O2 <- here("Oxygen", "Oxygen.csv") %>%
+  read_csv() %>%
+  mutate(Treatment = if_else(Channel == 1, "Control", "Sulfate")) %T>%
+  print()
+
+require(geomtextpath)
+Fig_S1 <- O2 %>%
+  ggplot(aes(delta_t/60, Value, colour = Treatment)) +
+    geom_point(shape = 16, alpha = 0.2) +
+    geom_textvline(data = . %>%
+                     group_by(Treatment) %>%
+                     filter(Value <= 0) %>%
+                     slice(1) %>%
+                     mutate(label = (delta_t/60) %>% signif(2) %>%
+                              str_c("h", sep = " ")),
+                   aes(xintercept = delta_t/60, colour = Treatment,
+                       label = label),
+                   family = "Futura", size = 3.5, hjust = 0.6,
+                   show.legend = FALSE) +
+    guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+    labs(x = "Time since kelp addition (hours)", 
+         y = "Oxygen (µM)") +
+    scale_colour_manual(values = c("#627d0e", "#7030a5")) +
+    scale_x_continuous(breaks = seq(0, 70, 10)) +
+    scale_y_continuous(breaks = seq(0, 210, 70)) +
+    coord_cartesian(xlim = c(0, 70), ylim = c(0, 210),
+                    expand = FALSE, clip = "off") +
+    mytheme +
+    theme(legend.position = c(0.86, 0.92),
+          plot.margin = margin(0.5, 0.5, 0.2, 0.2, unit = "cm"))
+
+Fig_S1
+
+Fig_S1 %>%
+  ggsave(filename = "Fig_S1.pdf", path = "Figures",
+         device = cairo_pdf, height = 8, width = 16, units = "cm")
+
+
+Fig_S2 <- TA %>%
+  filter(Experiment == 1) %>%
+  mutate(Treatment = Treatment %>% fct_relevel("Control", "Sulfate")) %>%
+  ggplot(aes(Day, TA / 1e3, colour = Treatment)) +
+    geom_point(shape = 16, size = 2.5, alpha = 0.7) +
+    geom_line(aes(group = Flask), alpha = 0.7) +
+    scale_colour_manual(values = c("#627d0e", "#7030a5", "#b3061e"),
+                        guide = "none") +
+    scale_alpha_manual(values = c(0.5, 0.4, 0.3), guide = "none") +
+    scale_x_continuous(breaks = seq(0, 90, 30)) +
+    scale_y_continuous(breaks = seq(0, 60, 20)) +
+    facet_grid(~ Treatment) +
+    labs(x = "Time since kelp addition (days)",
+         y = "Total alkalinity (mM)") +
+    coord_cartesian(xlim = c(0, 90), ylim = c(0, 60),
+                    expand = FALSE, clip = "off") +
+    mytheme +
+    # Strip text creates a lot of space
+    theme(plot.margin = margin(0, 0.5, 0.2, 0.2, unit = "cm"))
+
+Fig_S2
+
+Fig_S2 %>%
+  ggsave(filename = "Fig_S2.pdf", path = "Figures",
+         device = cairo_pdf, height = 6.3, width = 20, units = "cm")
 
 # Tables
 require(glue)
@@ -604,6 +965,8 @@ Table_2 %>%
 read_docx() %>%
   body_add_table(value = Table_2) %>%
   print(target = here("Tables", "Table_2.docx"))
+
+
 
 
 
