@@ -600,8 +600,7 @@ TA_surplus <- TA_prior_posterior %>%
   print()
 
 
-CN <- here("Alkalinity", "Carbon.csv") %>%
-  read_csv() %T>%
+CN <- read_csv("Carbon.csv") %T>%
   print()
 
 # Add kelp mass and carbon content to TA_surplus
@@ -869,31 +868,226 @@ Fig_S1 %>%
          device = cairo_pdf, height = 8, width = 16, units = "cm")
 
 
-Fig_S2 <- TA %>%
+Fig_S2a <- TA %>%
   filter(Experiment == 1) %>%
   mutate(Treatment = Treatment %>% fct_relevel("Control", "Sulfate")) %>%
   ggplot(aes(Day, TA / 1e3, colour = Treatment)) +
     geom_point(shape = 16, size = 2.5, alpha = 0.7) +
-    geom_line(aes(group = Flask), alpha = 0.7) +
+    geom_line(aes(group = Flask), alpha = 0.7, 
+              lineend = "round", linejoin = "round") +
     scale_colour_manual(values = c("#627d0e", "#7030a5", "#b3061e"),
                         guide = "none") +
-    scale_alpha_manual(values = c(0.5, 0.4, 0.3), guide = "none") +
     scale_x_continuous(breaks = seq(0, 90, 30)) +
     scale_y_continuous(breaks = seq(0, 60, 20)) +
     facet_grid(~ Treatment) +
     labs(x = "Time since kelp addition (days)",
-         y = "Total alkalinity (mM)") +
+         y = "TA (mM)") +
     coord_cartesian(xlim = c(0, 90), ylim = c(0, 60),
                     expand = FALSE, clip = "off") +
     mytheme +
-    # Strip text creates a lot of space
-    theme(plot.margin = margin(0, 0.5, 0.2, 0.2, unit = "cm"))
+    theme(plot.margin = margin(0, 0.5, 0.2, 0.2, unit = "cm"),
+          axis.title.y = element_text(vjust = 0.4, margin = margin(l = -0.3, unit = "cm")))
+
+Fig_S2a
+
+Fig_S2b <- TA %>%
+  filter(Experiment == 1) %>%
+  mutate(Treatment = Treatment %>% fct_relevel("Control", "Sulfate")) %>%
+  ggplot(aes(Day, pH, colour = Treatment)) +
+    geom_point(shape = 16, size = 2.5, alpha = 0.7) +
+    geom_line(aes(group = Flask), alpha = 0.7, 
+              lineend = "round", linejoin = "round") +
+    scale_colour_manual(values = c("#627d0e", "#7030a5", "#b3061e"),
+                        guide = "none") +
+    scale_x_continuous(breaks = seq(0, 90, 30)) +
+    facet_grid(~ Treatment) +
+    labs(x = "Time since kelp addition (days)",
+         y = "pH") +
+    coord_cartesian(xlim = c(0, 90), ylim = c(4, 8),
+                    expand = FALSE, clip = "off") +
+    mytheme +
+    theme(plot.margin = margin(0, 0.5, 0.2, 0.2, unit = "cm"),
+          axis.title.y = element_text(vjust = 0.4, margin = margin(l = -0.3, unit = "cm")))
+
+Fig_S2b
+
+Fig_S2c <- TA %>%
+  filter(Experiment == 1 & !is.na(NH4)) %>%
+  mutate(NH4_uM = NH4 / 14.007, # µg N in NH4 / 14.007 is µM N in NH4 = µM NH4
+         Treatment = Treatment %>% fct_relevel("Control", "Sulfate")) %>%
+  ggplot(aes(Day, NH4_uM, colour = Treatment)) +
+    geom_point(shape = 16, size = 2.5, alpha = 0.7) +
+    geom_line(aes(group = Flask), alpha = 0.7, 
+              lineend = "round", linejoin = "round") +
+    scale_colour_manual(values = c("#627d0e", "#7030a5", "#b3061e"),
+                        guide = "none") +
+    scale_x_continuous(breaks = seq(0, 90, 30)) +
+    scale_y_continuous(breaks = seq(0, 180, 60)) +
+    facet_grid(~ Treatment) +
+    labs(x = "Time since kelp addition (days)",
+         y = expression("NH"[4]^"+"*" (µM)")) +
+    coord_cartesian(xlim = c(0, 90), ylim = c(0, 180),
+                    expand = FALSE, clip = "off") +
+    mytheme +
+    theme(plot.margin = margin(0, 0.5, 0.2, 0.2, unit = "cm"),
+          axis.title.y = element_text(vjust = 0, margin = margin(l = -0.3, unit = "cm")))
+
+Fig_S2c
+
+Fig_S2d <- TA %>%
+  filter(Experiment == 1 & !is.na(NOx)) %>%
+  mutate(NOx_uM = NOx / 14.007, # µg N in NOx / 14.007 is µM N in NOx = µM NOx
+         Treatment = Treatment %>% fct_relevel("Control", "Sulfate")) %>%
+  ggplot(aes(Day, NOx_uM, colour = Treatment)) +
+    geom_point(shape = 16, size = 2.5, alpha = 0.7) +
+    geom_line(aes(group = Flask), alpha = 0.7, 
+              lineend = "round", linejoin = "round") +
+    scale_colour_manual(values = c("#627d0e", "#7030a5", "#b3061e"),
+                        guide = "none") +
+    scale_x_continuous(breaks = seq(0, 90, 30)) +
+    facet_grid(~ Treatment) +
+    labs(x = "Time since kelp addition (days)",
+         y = expression("NO"[italic("x")]*" (µM)")) +
+    coord_cartesian(xlim = c(0, 90), ylim = c(0, 20),
+                    expand = FALSE, clip = "off") +
+    mytheme +
+    theme(plot.margin = margin(0, 0.5, 0.2, 0.2, unit = "cm"),
+          axis.title.y = element_text(vjust = 0.07, margin = margin(l = -0.3, unit = "cm")))
+
+Fig_S2d
+
+Fig_S2e <- TA %>%
+  filter(Experiment == 1 & !is.na(PO4)) %>%
+  mutate(PO4_uM = PO4 / 30.974, # µg P in PO4 / 30.974 is µM P in PO4 = µM PO4
+         Treatment = Treatment %>% fct_relevel("Control", "Sulfate")) %>%
+  ggplot(aes(Day, PO4_uM, colour = Treatment)) +
+    geom_point(shape = 16, size = 2.5, alpha = 0.7) +
+    geom_line(aes(group = Flask), alpha = 0.7, 
+              lineend = "round", linejoin = "round") +
+    scale_colour_manual(values = c("#627d0e", "#7030a5", "#b3061e"),
+                        guide = "none") +
+    scale_x_continuous(breaks = seq(0, 90, 30)) +
+    scale_y_continuous(breaks = seq(0, 450, 150)) +
+    facet_grid(~ Treatment) +
+    labs(x = "Time since kelp addition (days)",
+         y = expression("PO"[4]^"3−"*" (µM)")) +
+    coord_cartesian(xlim = c(0, 90), ylim = c(0, 450),
+                    expand = FALSE, clip = "off") +
+    mytheme +
+    theme(plot.margin = margin(0, 0.5, 0.2, 0.2, unit = "cm"),
+          axis.title.y = element_text(vjust = 0.03, margin = margin(l = -0.3, unit = "cm")))
+
+Fig_S2e
+
+Fig_S2 <- ( ( Fig_S2a + 
+                theme(axis.title.x = element_blank(),
+                      axis.text.x = element_blank()) ) / 
+              ( Fig_S2b + 
+                  theme(axis.title.x = element_blank(),
+                        axis.text.x = element_blank(),
+                        strip.text = element_blank(),
+                        plot.margin = margin(0.5, 0.5, 0.2, 0.2, unit = "cm")) ) /
+              ( Fig_S2c + 
+                  theme(axis.title.x = element_blank(),
+                        axis.text.x = element_blank(),
+                        strip.text = element_blank(),
+                        plot.margin = margin(0.5, 0.5, 0.2, 0.2, unit = "cm")) ) /
+              ( Fig_S2d + 
+                  theme(axis.title.x = element_blank(),
+                        axis.text.x = element_blank(),
+                        strip.text = element_blank(),
+                        plot.margin = margin(0.5, 0.5, 0.2, 0.2, unit = "cm")) ) /
+              Fig_S2e + 
+                theme(strip.text = element_blank(),
+                      plot.margin = margin(0.5, 0.5, 0.2, 0.2, unit = "cm")) ) # + 
+  # plot_annotation(tag_levels = "a") &
+  # theme(plot.tag = element_text(family = "Futura", size = 15, face = "bold"),
+  #       plot.tag.position = c(0.008, 1.01))
 
 Fig_S2
 
 Fig_S2 %>%
   ggsave(filename = "Fig_S2.pdf", path = "Figures",
-         device = cairo_pdf, height = 6.3, width = 20, units = "cm")
+         device = cairo_pdf, height = 20, width = 20, units = "cm")
+
+
+Fig_S3a <- TA_Exp2 %>%
+  ggplot(aes(Day, pH, colour = Treatment)) +
+    geom_point(shape = 16, size = 2.5, alpha = 0.7) +
+    geom_line(aes(group = Flask), alpha = 0.7, 
+              lineend = "round", linejoin = "round") +
+    scale_colour_manual(values = c("#627d0e", "#7030a5", "#f1c700", "#6f5229"),
+                        guide = "none") +
+    scale_x_continuous(breaks = seq(0, 240, 60)) +
+    facet_grid(~ Treatment %>% fct_relevel("Blank", "Control", "Sulfate")) +
+    labs(x = "Time since kelp addition (days)",
+         y = "pH") +
+    coord_cartesian(xlim = c(0, 240), ylim = c(4, 8),
+                    expand = FALSE, clip = "off") +
+    mytheme +
+    theme(plot.margin = margin(0, 0.5, 0.2, 0.2, unit = "cm"),
+          axis.title.y = element_text(vjust = 0.4, margin = margin(l = -0.3, unit = "cm")))
+
+Fig_S3a
+
+Fig_S3b <- NH4_Exp2 %>%
+  mutate(NOx_uM = NOx / 14.007) %>%
+  ggplot(aes(Day, NOx_uM, colour = Treatment)) +
+    geom_point(shape = 16, size = 2.5, alpha = 0.7) +
+    geom_line(aes(group = Flask), alpha = 0.7, 
+              lineend = "round", linejoin = "round") +
+    scale_colour_manual(values = c("#627d0e", "#7030a5", "#f1c700", "#6f5229"),
+                        guide = "none") +
+    scale_x_continuous(breaks = seq(0, 240, 60)) +
+    facet_grid(~ Treatment %>% fct_relevel("Blank", "Control", "Sulfate")) +
+    labs(x = "Time since kelp addition (days)",
+         y = expression("NO"[italic("x")]*" (µM)")) +
+    coord_cartesian(xlim = c(0, 240), ylim = c(0, 150),
+                    expand = FALSE, clip = "off") +
+    mytheme +
+    theme(plot.margin = margin(0, 0.5, 0.2, 0.2, unit = "cm"),
+          axis.title.y = element_text(vjust = 0.07, margin = margin(l = -0.3, unit = "cm")))
+
+Fig_S3b
+
+Fig_S3c <- NH4_Exp2 %>%
+  mutate(PO4_uM = PO4 / 30.974) %>%
+  ggplot(aes(Day, PO4_uM, colour = Treatment)) +
+    geom_point(shape = 16, size = 2.5, alpha = 0.7) +
+    geom_line(aes(group = Flask), alpha = 0.7, 
+              lineend = "round", linejoin = "round") +
+    scale_colour_manual(values = c("#627d0e", "#7030a5", "#f1c700", "#6f5229"),
+                        guide = "none") +
+    scale_x_continuous(breaks = seq(0, 240, 60)) +
+    scale_y_continuous(breaks = seq(0, 90, 30)) +
+    facet_grid(~ Treatment %>% fct_relevel("Blank", "Control", "Sulfate")) +
+    labs(x = "Time since kelp addition (days)",
+         y = expression("PO"[4]^"3−"*" (µM)")) +
+    coord_cartesian(xlim = c(0, 240), ylim = c(0, 90),
+                    expand = FALSE, clip = "off") +
+    mytheme +
+    theme(plot.margin = margin(0, 0.5, 0.2, 0.2, unit = "cm"),
+          axis.title.y = element_text(vjust = 0.03, margin = margin(l = -0.3, unit = "cm")))
+
+Fig_S3c
+
+Fig_S3 <- ( ( Fig_S3a + 
+                theme(axis.title.x = element_blank(),
+                      axis.text.x = element_blank()) ) / 
+              ( Fig_S3b + 
+                  theme(axis.title.x = element_blank(),
+                        axis.text.x = element_blank(),
+                        strip.text = element_blank(),
+                        plot.margin = margin(0.5, 0.5, 0.2, 0.2, unit = "cm")) ) /
+              Fig_S3c + 
+                theme(strip.text = element_blank(),
+                      plot.margin = margin(0.5, 0.5, 0.2, 0.2, unit = "cm")) )
+
+Fig_S3
+
+Fig_S3 %>%
+  ggsave(filename = "Fig_S3.pdf", path = "Figures",
+         device = cairo_pdf, height = 12.7, width = 20, units = "cm")
 
 # Tables
 require(glue)
@@ -966,7 +1160,21 @@ read_docx() %>%
   body_add_table(value = Table_2) %>%
   print(target = here("Tables", "Table_2.docx"))
 
-
+TA %>%
+  drop_na(Day) %>%
+  filter(Experiment == 3 & Day == max(Day),
+         .by = Experiment) %>%
+  summarise(
+    TA_mean = mean(TA/1e3),
+    TA_sd = sd(TA/1e3),
+    n = n(),
+    .by = Treatment
+  ) %>%
+  mutate(
+    across(where(is.numeric), ~signif(.x, 2)),
+    TA = glue("{TA_mean} ± {TA_sd}")
+  ) %>%
+  select(!c(ends_with("mean"), ends_with("sd")))
 
 
 
