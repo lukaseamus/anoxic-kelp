@@ -34,7 +34,7 @@ mytheme <- theme(panel.background = element_blank(),
                  strip.background = element_blank(),
                  strip.text = element_text(size = 12, hjust = 0, face = "bold"),
                  panel.spacing.x = unit(1, "cm"),
-                 panel.spacing.y = unit(1, "cm"),
+                 panel.spacing.y = unit(0.8, "cm"),
                  text = element_text(family = "Futura"))
 
 TA %>%
@@ -829,6 +829,455 @@ Fig_2 %>%
   ggsave(filename = "Fig_2.pdf", path = "Figures",
          device = cairo_pdf, height = 14, width = 20, units = "cm")
 
+
+# Calculate DIC
+require(seacarb)
+TA %<>%
+  mutate(
+    # Convert nutrients from µg N or P to M
+    NH4_M = NH4 / 14.007 * 1e-6,
+    PO4_M = PO4 / 30.974 * 1e-6,
+    # Infer H2S from TA
+    H2S_M = TA * 0.5 * 1e-6, # based on 2CH2O + SO42− -> 2HCO3− + H2S
+    # Calculate DIC three ways (TA must be given in M)
+    DIC_naive = carb(
+      flag = 8, var1 = pH, var2 = TA*1e-6, pHscale = "F", 
+      S = 35, T = 18, Patm = 1, P = 0
+    )$DIC*1e6, # convert DIC from M to µM
+    DIC_nutri = if_else( # carbfull will not return NA if nutrients are NA
+      !is.na(NH4) & !is.na(PO4),
+      carbfull(
+        flag = 8, var1 = pH, var2 = TA*1e-6, pHscale = "F", 
+        S = 35, T = 18, Patm = 1, P = 0, Pt = PO4_M, NH4t = NH4_M
+      )$DIC*1e6,
+      NA
+    ),
+    DIC_sulf = if_else(
+      !is.na(NH4) & !is.na(PO4) & !is.na(H2S_M),
+      carbfull(
+        flag = 8, var1 = pH, var2 = TA*1e-6, pHscale = "F", 
+        S = 35, T = 18, Patm = 1, P = 0, Pt = PO4_M, 
+        NH4t = NH4_M, HSt = H2S_M
+      )$DIC*1e6,
+      NA
+    )
+  ) %T>% 
+  print()
+
+DICTA_Exp2 <- TA %>%
+  filter(Experiment == 2) %>%
+  drop_na(TA) %>%
+  mutate(Treatment = Treatment %>% fct(),
+         Flask = Flask %>% as_factor()) %T>%
+  print()
+
+# Experiment 2 models
+DICTA_Exp2_model <- here("Alkalinity", "Stan", "DICTA_Exp2.stan") %>% 
+  read_file() %>%
+  write_stan_file() %>%
+  cmdstan_model()
+
+DICTA_Exp2_naive_samples <- DICTA_Exp2_model$sample(
+          data = DICTA_Exp2 %>%
+            filter(Day != 8 | Treatment == "Blank") %>% # remove organic acid outliers
+            select(DIC_naive, TA, Treatment, Flask) %>%
+            rename(DIC = DIC_naive) %>%
+            compose_data(),
+          chains = 8,
+          parallel_chains = parallel::detectCores(),
+          iter_warmup = 1e4,
+          iter_sampling = 1e4,
+          adapt_delta = 0.95
+        ) %T>%
+  print()
+
+DICTA_Exp2_nutri_samples <- DICTA_Exp2_model$sample(
+          data = DICTA_Exp2 %>%
+            filter(Day != 8 | Treatment == "Blank") %>% # remove organic acid outliers
+            select(DIC_nutri, TA, Treatment, Flask) %>%
+            drop_na(DIC_nutri) %>% # drop rows where nutrients are NA
+            rename(DIC = DIC_nutri) %>%
+            compose_data(),
+          chains = 8,
+          parallel_chains = parallel::detectCores(),
+          iter_warmup = 1e4,
+          iter_sampling = 1e4,
+          adapt_delta = 0.95
+        ) %T>%
+  print()
+
+DICTA_Exp2_sulf_samples <- DICTA_Exp2_model$sample(
+          data = DICTA_Exp2 %>%
+            filter(Day != 8 | Treatment == "Blank") %>% # remove organic acid outliers
+            select(DIC_sulf, TA, Treatment, Flask) %>%
+            drop_na(DIC_sulf) %>%
+            rename(DIC = DIC_sulf) %>%
+            compose_data(),
+          chains = 8,
+          parallel_chains = parallel::detectCores(),
+          iter_warmup = 1e4,
+          iter_sampling = 1e4,
+          adapt_delta = 0.95
+        ) %T>%
+  print()
+
+
+# Save draws
+DICTA_Exp2_naive_samples$draws() %>%
+  write_rds(here("Alkalinity", "RDS", "DICTA_Exp2_naive_samples.rds"))
+DICTA_Exp2_naive_samples$draws(format = "df") %>%
+  write_rds(here("Alkalinity", "RDS", "DICTA_Exp2_naive_samples_df.rds"))
+DICTA_Exp2_nutri_samples$draws() %>%
+  write_rds(here("Alkalinity", "RDS", "DICTA_Exp2_nutri_samples.rds"))
+DICTA_Exp2_nutri_samples$draws(format = "df") %>%
+  write_rds(here("Alkalinity", "RDS", "DICTA_Exp2_nutri_samples_df.rds"))
+DICTA_Exp2_sulf_samples$draws() %>%
+  write_rds(here("Alkalinity", "RDS", "DICTA_Exp2_sulf_samples.rds"))
+DICTA_Exp2_sulf_samples$draws(format = "df") %>%
+  write_rds(here("Alkalinity", "RDS", "DICTA_Exp2_sulf_samples_df.rds"))
+
+# 2.1.3 Model checks ####
+# Rhat
+DICTA_Exp2_naive_samples$summary() %>%
+  summarise(rhat_1.001 = mean( rhat > 1.001 ),
+            rhat_mean = mean(rhat),
+            rhat_sd = sd(rhat))
+# No rhat above 1.001. rhat = 1.00 ± 0.0000614.
+
+DICTA_Exp2_nutri_samples$summary() %>%
+  summarise(rhat_1.001 = mean( rhat > 1.001 ),
+            rhat_mean = mean(rhat),
+            rhat_sd = sd(rhat))
+# No rhat above 1.001. rhat = 1.00 ± 0.0000878.
+
+DICTA_Exp2_sulf_samples$summary() %>%
+  summarise(rhat_1.001 = mean( rhat > 1.001 ),
+            rhat_mean = mean(rhat),
+            rhat_sd = sd(rhat))
+# No rhat above 1.001. rhat = 1.00 ± 0.0000629.
+
+# Chains
+DICTA_Exp2_naive_samples$draws(format = "df") %>%
+  mcmc_rank_overlay()
+DICTA_Exp2_nutri_samples$draws(format = "df") %>%
+  mcmc_rank_overlay()
+DICTA_Exp2_sulf_samples$draws(format = "df") %>%
+  mcmc_rank_overlay()
+
+# Pairs
+DICTA_Exp2_naive_samples$draws(format = "df") %>%
+  mcmc_pairs(pars = c("A0_mu", "q_mu"))
+DICTA_Exp2_nutri_samples$draws(format = "df") %>%
+  mcmc_pairs(pars = c("A0_mu", "q_mu"))
+DICTA_Exp2_sulf_samples$draws(format = "df") %>%
+  mcmc_pairs(pars = c("A0_mu", "q_mu"))
+# No correlation between intercept and slope
+
+DICTA_Exp2_naive_samples$draws(format = "df") %>%
+  mcmc_pairs(pars = c("A0_T[1]", "A0_F[1]", "A0_T[2]", "A0_F[2]"))
+DICTA_Exp2_naive_samples$draws(format = "df") %>%
+  mcmc_pairs(pars = c("q_T[1]", "q_F[1]", "q_T[2]", "q_F[2]"))
+DICTA_Exp2_nutri_samples$draws(format = "df") %>%
+  mcmc_pairs(pars = c("q_T[1]", "q_F[1]", "q_T[2]", "q_F[2]"))
+DICTA_Exp2_nutri_samples$draws(format = "df") %>%
+  mcmc_pairs(pars = c("A0_T[1]", "A0_F[1]", "A0_T[2]", "A0_F[2]"))
+DICTA_Exp2_sulf_samples$draws(format = "df") %>%
+  mcmc_pairs(pars = c("q_T[1]", "q_F[1]", "q_T[2]", "q_F[2]"))
+DICTA_Exp2_sulf_samples$draws(format = "df") %>%
+  mcmc_pairs(pars = c("A0_T[1]", "A0_F[1]", "A0_T[2]", "A0_F[2]"))
+# Strong correlation between flasks and treatments, meaning they are hardly
+# distinguishable. Nonetheless, I choose these as the optimal models.
+
+# 2.1.4 Prior-posterior comparison ####
+DICTA_Exp2_prior <- prior_samples(
+  model = DICTA_Exp2_model,
+  data = DICTA_Exp2 %>%
+    select(DIC_naive, TA, Treatment, Flask) %>%
+    rename(DIC = DIC_naive) %>%
+    compose_data()
+)
+
+DICTA_Exp2_prior %>% 
+  prior_posterior_draws(
+    posterior_samples = DICTA_Exp2_naive_samples,
+    group = DICTA_Exp2 %>% select(Treatment, Flask),
+    parameters = c("A0_mu", "q_mu", "sigma", 
+                   "A0_T[Treatment]", "A0_F[Flask]", 
+                   "q_T[Treatment]", "q_F[Flask]", 
+                   "A0_T_sigma", "A0_F_sigma",
+                   "q_T_sigma", "q_F_sigma"),
+    format = "long"
+    ) %>%
+  prior_posterior_plot(
+    group_name = "Treatment",
+    second_group_name = "Flask"
+  )
+
+DICTA_Exp2_prior %>% 
+  prior_posterior_draws(
+    posterior_samples = DICTA_Exp2_nutri_samples,
+    group = DICTA_Exp2 %>% select(Treatment, Flask),
+    parameters = c("A0_mu", "q_mu", "sigma", 
+                   "A0_T[Treatment]", "A0_F[Flask]", 
+                   "q_T[Treatment]", "q_F[Flask]", 
+                   "A0_T_sigma", "A0_F_sigma",
+                   "q_T_sigma", "q_F_sigma"),
+    format = "long"
+    ) %>%
+  prior_posterior_plot(
+    group_name = "Treatment",
+    second_group_name = "Flask"
+  )
+
+DICTA_Exp2_prior %>% 
+  prior_posterior_draws(
+    posterior_samples = DICTA_Exp2_sulf_samples,
+    group = DICTA_Exp2 %>% select(Treatment, Flask),
+    parameters = c("A0_mu", "q_mu", "sigma", 
+                   "A0_T[Treatment]", "A0_F[Flask]", 
+                   "q_T[Treatment]", "q_F[Flask]", 
+                   "A0_T_sigma", "A0_F_sigma",
+                   "q_T_sigma", "q_F_sigma"),
+    format = "long"
+    ) %>%
+  prior_posterior_plot(
+    group_name = "Treatment",
+    second_group_name = "Flask"
+  )
+
+# 2.1.5 Parameters ####
+DICTA_Exp2_naive_prior_posterior <- DICTA_Exp2_prior %>% 
+  prior_posterior_draws(
+    posterior_samples = DICTA_Exp2_naive_samples,
+    group = DICTA_Exp2 %>% select(Treatment),
+    parameters = c("A0_T[Treatment]", "A0_F_sigma", 
+                   "q_T[Treatment]", "q_F_sigma", "sigma"),
+    format = "short"
+  ) %>% 
+  mutate( # Calculate parameters for new flasks
+    A0 = rnorm( n() , A0_T , A0_F_sigma ),
+    q = rnorm( n() , q_T , q_F_sigma )
+  ) %>% # Embed prior in treatments
+  filter(Treatment == "Control" & distribution == "prior" |
+           distribution == "posterior") %>%
+  mutate(
+    Treatment = if_else(
+      distribution == "prior", "Prior", Treatment
+    ) %>% fct()
+  ) %>%
+  select(starts_with("."), Treatment, A0, q, sigma, q_F_sigma) %T>%
+  print()
+
+DICTA_Exp2_nutri_prior_posterior <- DICTA_Exp2_prior %>% 
+  prior_posterior_draws(
+    posterior_samples = DICTA_Exp2_nutri_samples,
+    group = DICTA_Exp2 %>% select(Treatment),
+    parameters = c("A0_T[Treatment]", "A0_F_sigma", 
+                   "q_T[Treatment]", "q_F_sigma", "sigma"),
+    format = "short"
+  ) %>% 
+  mutate(
+    A0 = rnorm( n() , A0_T , A0_F_sigma ),
+    q = rnorm( n() , q_T , q_F_sigma )
+  ) %>% 
+  filter(Treatment == "Control" & distribution == "prior" |
+           distribution == "posterior") %>%
+  mutate(
+    Treatment = if_else(
+      distribution == "prior", "Prior", Treatment
+    ) %>% fct()
+  ) %>%
+  select(starts_with("."), Treatment, A0, q, sigma, q_F_sigma) %T>%
+  print()
+
+DICTA_Exp2_sulf_prior_posterior <- DICTA_Exp2_prior %>% 
+  prior_posterior_draws(
+    posterior_samples = DICTA_Exp2_sulf_samples,
+    group = DICTA_Exp2 %>% select(Treatment),
+    parameters = c("A0_T[Treatment]", "A0_F_sigma", 
+                   "q_T[Treatment]", "q_F_sigma", "sigma"),
+    format = "short"
+  ) %>% 
+  mutate(
+    A0 = rnorm( n() , A0_T , A0_F_sigma ),
+    q = rnorm( n() , q_T , q_F_sigma )
+  ) %>% 
+  filter(Treatment == "Control" & distribution == "prior" |
+           distribution == "posterior") %>%
+  mutate(
+    Treatment = if_else(
+      distribution == "prior", "Prior", Treatment
+    ) %>% fct()
+  ) %>%
+  select(starts_with("."), Treatment, A0, q, sigma, q_F_sigma) %T>%
+  print()
+
+# Save parameter distributions
+DICTA_Exp2_naive_prior_posterior %>%
+  write_rds(here("Alkalinity", "RDS", "DICTA_Exp2_naive_prior_posterior.rds"))
+DICTA_Exp2_nutri_prior_posterior %>%
+  write_rds(here("Alkalinity", "RDS", "DICTA_Exp2_nutri_prior_posterior.rds"))
+DICTA_Exp2_sulf_prior_posterior %>%
+  write_rds(here("Alkalinity", "RDS", "DICTA_Exp2_sulf_prior_posterior.rds"))
+
+# 2.1.6 Prediction ####
+DICTA_Exp2_naive_prediction <- DICTA_Exp2_naive_prior_posterior %>%
+  spread_continuous(
+    data = DICTA_Exp2 %>% 
+      filter(Day != 8 | Treatment == "Blank"),
+    predictor_name = "DIC_naive",
+    group_name = "Treatment"
+  ) %>%
+  mutate( 
+    mu = A0 + q * DIC_naive,
+    TA = rnorm( n() , mu , sigma )
+  ) %>%
+  group_by(Treatment, DIC_naive) %>%
+  median_qi(mu, TA, .width = c(.5, .8, .9)) %T>%
+  print()
+
+DICTA_Exp2_nutri_prediction <- DICTA_Exp2_nutri_prior_posterior %>%
+  spread_continuous(
+    data = DICTA_Exp2 %>% 
+      filter(Day != 8 | Treatment == "Blank") %>% 
+      drop_na(DIC_nutri),
+    predictor_name = "DIC_nutri",
+    group_name = "Treatment"
+  ) %>%
+  mutate( 
+    mu = A0 + q * DIC_nutri,
+    TA = rnorm( n() , mu , sigma )
+  ) %>%
+  group_by(Treatment, DIC_nutri) %>%
+  median_qi(mu, TA, .width = c(.5, .8, .9)) %T>%
+  print()
+
+DICTA_Exp2_sulf_prediction <- DICTA_Exp2_sulf_prior_posterior %>%
+  spread_continuous(
+    data = DICTA_Exp2 %>% 
+      filter(Day != 8 | Treatment == "Blank") %>%
+      drop_na(DIC_sulf),
+    predictor_name = "DIC_sulf",
+    group_name = "Treatment"
+  ) %>%
+  mutate( 
+    mu = A0 + q * DIC_sulf,
+    TA = rnorm( n() , mu , sigma )
+  ) %>%
+  group_by(Treatment, DIC_sulf) %>%
+  median_qi(mu, TA, .width = c(.5, .8, .9)) %T>%
+  print()
+
+
+DICTA_Exp2_naive_prediction %>%
+  write_rds(here("Alkalinity", "RDS", "DICTA_Exp2_naive_prediction.rds"))
+DICTA_Exp2_nutri_prediction %>%
+  write_rds(here("Alkalinity", "RDS", "DICTA_Exp2_nutri_prediction.rds"))
+DICTA_Exp2_sulf_prediction %>%
+  write_rds(here("Alkalinity", "RDS", "DICTA_Exp2_sulf_prediction.rds"))
+
+DICTA_Exp2 %<>%
+  select(Treatment, Flask, Day, TA, starts_with("DIC")) %>%
+  pivot_longer(cols = starts_with("DIC"),
+               names_to = "Calculation",
+               values_to = "DIC",
+               names_prefix = "DIC_") %>%
+  mutate(
+    Calculation = Calculation %>% 
+      fct_recode(Naive = "naive", Nutrients = "nutri", Bisulfide = "sulf") %>%
+      fct_relevel("Naive", "Nutrients")
+  ) %T>%
+  print()
+
+Fig_3a <- bind_rows(
+  Naive = DICTA_Exp2_naive_prediction %>% rename(DIC = DIC_naive),
+  Nutrients = DICTA_Exp2_nutri_prediction %>% rename(DIC = DIC_nutri),
+  Bisulfide = DICTA_Exp2_sulf_prediction %>% rename(DIC = DIC_sulf),
+  .id = "Calculation"
+) %>%
+  mutate(Calculation = Calculation %>% fct_relevel("Naive", "Nutrients")) %>%
+  filter(Treatment != "Prior") %>%
+  ggplot() +
+    geom_textabline(slope = rep(1, 12), label = "1:1",
+                    family = "Futura", size = 3.5, hjust = 1) +
+    geom_point(data = DICTA_Exp2 %>% drop_na(DIC),
+               aes(DIC / 1e3, TA / 1e3, colour = Treatment),
+               shape = 16, size = 2.5, alpha = 0.7) +
+    geom_path(data = DICTA_Exp2 %>% drop_na(DIC),
+              aes(DIC / 1e3, TA / 1e3, 
+                  colour = Treatment, group = Flask), 
+              # arrow = arrow(length = unit(0.2, "cm"), 
+              #               type = "closed", angle = 20),
+              alpha = 0.7, lineend = "round", linejoin = "round") +
+    geom_line(aes(DIC / 1e3, TA / 1e3, colour = Treatment)) +
+    geom_ribbon(aes(DIC / 1e3, ymin = TA.lower / 1e3, 
+                    ymax = TA.upper / 1e3,
+                    alpha = factor(.width),
+                    fill = Treatment)) +
+    scale_colour_manual(values = c("#627d0e", "#7030a5", "#f1c700", "#6f5229"),
+                        guide = "none") +
+    scale_fill_manual(values = c("#627d0e", "#7030a5", "#f1c700", "#6f5229"),
+                      guide = "none") +
+    scale_alpha_manual(values = c(0.5, 0.4, 0.3), guide = "none") +
+    facet_grid(Calculation ~ Treatment %>% fct_relevel("Blank", "Control", "Sulfate"),
+                switch = "y") +
+    labs(x = "Dissolved inorganic carbon (mM)",
+         y = "Total alkalinity (mM)") +
+    coord_cartesian(xlim = c(0, 80), ylim = c(0, 80),
+                    expand = FALSE, clip = "off") +
+    mytheme +
+    theme(plot.margin = margin(0, 0.5, 0.2, 0.2, unit = "cm"),
+          strip.text.y = element_text(face = "plain"),
+          axis.title.y = element_text(margin = margin(r = -0.1, unit = "cm")))
+
+Fig_3a
+
+# q
+Fig_3b <- bind_rows(
+  Naive = DICTA_Exp2_naive_prior_posterior,
+  Nutrients = DICTA_Exp2_nutri_prior_posterior,
+  Bisulfide = DICTA_Exp2_sulf_prior_posterior,
+  .id = "Calculation"
+) %>%
+  mutate(Calculation = Calculation %>% fct_relevel("Bisulfide", "Nutrients")) %>%
+  filter(Treatment != "Prior") %>%
+  ggplot() +
+    stat_density_ridges(aes(q, y = Calculation, fill = Treatment),
+                        from = 0.5, to = 2.5, n = 2^10, bandwidth = 2 * 0.02, 
+                        scale = 1, colour = NA) +
+    geom_vline(xintercept = 1) +
+    scale_fill_manual(values = c("#627d0e", "#7030a5", "#f1c700", "#6f5229"),
+                      guide = "none") +
+    scale_x_continuous(limits = c(0.5, 2.5),
+                       labels = scales::label_number(accuracy = c(0.1, 1, 0.1, 1, 0.1)),
+                       oob = scales::oob_keep) +
+    facet_grid(~ Treatment %>% fct_relevel("Blank", "Control", "Sulfate")) +
+    labs(x = expression(italic("q")*" (TA/DIC)")) +
+    coord_cartesian(expand = FALSE, clip = "off") +
+    mytheme +
+    theme(axis.title.y = element_blank(),
+          axis.line.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_text(size = 12, vjust = -0.2, hjust = 0,
+                                     margin = margin(r = -0.8, unit = "cm")),
+          strip.text = element_blank())
+
+Fig_3b
+
+
+Fig_3 <- ( Fig_3a / Fig_3b ) +
+  plot_layout(heights = c(1, 0.2))
+Fig_3
+
+Fig_3 %>%
+  ggsave(filename = "Fig_3.pdf", path = "Figures",
+         device = cairo_pdf, height = 18.9, width = 20, units = "cm")
+
+
+
+
+
+
 # Figure S1
 O2 <- here("Oxygen", "Oxygen.csv") %>%
   read_csv() %>%
@@ -1011,7 +1460,77 @@ Fig_S2 %>%
          device = cairo_pdf, height = 20, width = 20, units = "cm")
 
 
-Fig_S3a <- TA_Exp2 %>%
+
+
+Fig_S3a <- TA %>%
+  filter(Experiment == 1 & !is.na(DIC_naive)) %>%
+  mutate(Treatment = Treatment %>% fct_relevel("Control", "Sulfate")) %>%
+  ggplot(aes(DIC_naive / 1e3, TA / 1e3, colour = Treatment)) +
+    geom_textabline(slope = rep(1, 3), label = "1:1", 
+                    family = "Futura", size = 3.5, hjust = 1) +
+    geom_point(shape = 16, size = 2.5, alpha = 0.7) +
+    geom_path(aes(group = Flask), alpha = 0.7,
+              lineend = "round", linejoin = "round",
+              arrow = arrow(length = unit(0.2, "cm"), 
+                            type = "closed", angle = 20)) +
+    scale_colour_manual(values = c("#627d0e", "#7030a5", "#b3061e"),
+                        guide = "none") +
+    scale_x_continuous(breaks = seq(0, 90, 30)) +
+    scale_y_continuous(breaks = seq(0, 90, 30)) +
+    facet_grid(~ Treatment) +
+    labs(x = "Dissolved inorganic carbon (mM)",
+         y = "Total alkalinity (mM)") +
+    coord_cartesian(xlim = c(0, 90), ylim = c(0, 90),
+                    expand = FALSE, clip = "off") +
+    mytheme +
+    theme(plot.margin = margin(0, 0.5, 0.2, 0.2, unit = "cm"))
+
+Fig_S3a
+
+Fig_S3b <- TA %>%
+  filter(Experiment == 1 & !is.na(DIC_nutri)) %>%
+  mutate(Treatment = Treatment %>% fct_relevel("Control", "Sulfate")) %>%
+  ggplot(aes(DIC_nutri / 1e3, TA / 1e3, colour = Treatment)) +
+    geom_textabline(slope = rep(1, 3), label = "1:1", 
+                    family = "Futura", size = 3.5, hjust = 1) +
+    geom_point(shape = 16, size = 2.5, alpha = 0.7) +
+    geom_path(aes(group = Flask), alpha = 0.7,
+              lineend = "round", linejoin = "round",
+              arrow = arrow(length = unit(0.2, "cm"), 
+                            type = "closed", angle = 20)) +
+    scale_colour_manual(values = c("#627d0e", "#7030a5", "#b3061e"),
+                        guide = "none") +
+    scale_x_continuous(breaks = seq(0, 90, 30)) +
+    scale_y_continuous(breaks = seq(0, 90, 30)) +
+    facet_grid(~ Treatment) +
+    labs(x = "Dissolved inorganic carbon (mM)",
+         y = "Total alkalinity (mM)") +
+    coord_cartesian(xlim = c(0, 90), ylim = c(0, 90),
+                    expand = FALSE, clip = "off") +
+    mytheme +
+    theme(plot.margin = margin(0, 0.5, 0.2, 0.2, unit = "cm"))
+
+Fig_S3b
+
+Fig_S3 <- ( ( Fig_S3a + 
+                theme(axis.title.x = element_blank(),
+                      axis.text.x = element_blank()) ) / 
+              Fig_S3b + 
+                theme(strip.text = element_blank(),
+                      plot.margin = margin(0.5, 0.5, 0.2, 0.2, unit = "cm")) ) + 
+plot_annotation(tag_levels = "a") &
+theme(plot.tag = element_text(family = "Futura", size = 15, face = "bold"),
+      plot.tag.position = c(0.008, 1.01))
+
+Fig_S3
+
+Fig_S3 %>%
+  ggsave(filename = "Fig_S3.pdf", path = "Figures",
+         device = cairo_pdf, height = 13.8, width = 20, units = "cm")
+
+
+
+Fig_S4a <- TA_Exp2 %>%
   ggplot(aes(Day, pH, colour = Treatment)) +
     geom_point(shape = 16, size = 2.5, alpha = 0.7) +
     geom_line(aes(group = Flask), alpha = 0.7, 
@@ -1028,9 +1547,9 @@ Fig_S3a <- TA_Exp2 %>%
     theme(plot.margin = margin(0, 0.5, 0.2, 0.2, unit = "cm"),
           axis.title.y = element_text(vjust = 0.4, margin = margin(l = -0.3, unit = "cm")))
 
-Fig_S3a
+Fig_S4a
 
-Fig_S3b <- NH4_Exp2 %>%
+Fig_S4b <- NH4_Exp2 %>%
   mutate(NOx_uM = NOx / 14.007) %>%
   ggplot(aes(Day, NOx_uM, colour = Treatment)) +
     geom_point(shape = 16, size = 2.5, alpha = 0.7) +
@@ -1048,9 +1567,9 @@ Fig_S3b <- NH4_Exp2 %>%
     theme(plot.margin = margin(0, 0.5, 0.2, 0.2, unit = "cm"),
           axis.title.y = element_text(vjust = 0.07, margin = margin(l = -0.3, unit = "cm")))
 
-Fig_S3b
+Fig_S4b
 
-Fig_S3c <- NH4_Exp2 %>%
+Fig_S4c <- NH4_Exp2 %>%
   mutate(PO4_uM = PO4 / 30.974) %>%
   ggplot(aes(Day, PO4_uM, colour = Treatment)) +
     geom_point(shape = 16, size = 2.5, alpha = 0.7) +
@@ -1069,24 +1588,24 @@ Fig_S3c <- NH4_Exp2 %>%
     theme(plot.margin = margin(0, 0.5, 0.2, 0.2, unit = "cm"),
           axis.title.y = element_text(vjust = 0.03, margin = margin(l = -0.3, unit = "cm")))
 
-Fig_S3c
+Fig_S4c
 
-Fig_S3 <- ( ( Fig_S3a + 
+Fig_S4 <- ( ( Fig_S4a + 
                 theme(axis.title.x = element_blank(),
                       axis.text.x = element_blank()) ) / 
-              ( Fig_S3b + 
+              ( Fig_S4b + 
                   theme(axis.title.x = element_blank(),
                         axis.text.x = element_blank(),
                         strip.text = element_blank(),
                         plot.margin = margin(0.5, 0.5, 0.2, 0.2, unit = "cm")) ) /
-              Fig_S3c + 
+              Fig_S4c + 
                 theme(strip.text = element_blank(),
                       plot.margin = margin(0.5, 0.5, 0.2, 0.2, unit = "cm")) )
 
-Fig_S3
+Fig_S4
 
-Fig_S3 %>%
-  ggsave(filename = "Fig_S3.pdf", path = "Figures",
+Fig_S4 %>%
+  ggsave(filename = "Fig_S4.pdf", path = "Figures",
          device = cairo_pdf, height = 12.7, width = 20, units = "cm")
 
 # Tables
