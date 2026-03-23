@@ -10,7 +10,7 @@ data{
 
 parameters{
   real A0_mu; // intercept, TA when DIC = 0
-  real q_mu; // slope, biogeochemical process vector
+  real q_mu; // slope, biogeochemical process quotient
   real<lower=0> A0_T_sigma;
   real<lower=0> A0_F_sigma;
   real<lower=0> q_T_sigma;
