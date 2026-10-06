@@ -49,8 +49,13 @@ po/*~
 rsconnect/
 
 .DS_Store
-Sequences
-Bacteria
 
+# DNA sequences
+Sequences
+
+# Temporary Microsoft files
 ~$*.docx
 ~$*.xlsx
+
+# RDS files
+*.rds
